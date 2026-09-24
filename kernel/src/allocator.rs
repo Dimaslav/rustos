@@ -2,7 +2,7 @@ use alloc::alloc::Layout;
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use linked_list_allocator::LockedHeap;
 
-pub const HEAP_SIZE: usize = 100 * 1024; // 100 КиБ
+pub const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
 #[global_allocator]
 pub static ALLOCATOR: LockedHeap = LockedHeap::empty();

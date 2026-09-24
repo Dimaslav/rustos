@@ -4,7 +4,10 @@ fn main() {
     let bios_path = env!("BIOS_PATH");
 
     let status = Command::new("qemu-system-x86_64")
-        .args(["-drive", &format!("format=raw,file={}", bios_path)])
+        .args([
+            "-drive", &format!("format=raw,file={}", bios_path),
+            "-display", "gtk",
+        ])
         .status()
         .expect("QEMU не найден. Установите qemu-system-x86_64 и добавьте в PATH.");
 

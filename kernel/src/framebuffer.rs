@@ -1,13 +1,14 @@
+use alloc::vec;
+use alloc::vec::Vec;
 use bootloader_api::info::{FrameBufferInfo, PixelFormat};
 use core::fmt;
 use noto_sans_mono_bitmap::{get_raster, FontWeight, RasterHeight};
 use spin::Mutex;
 
-/// Размер знакоместа. Noto Sans Mono Size16 — 9×16 пикселей.
 pub const FONT_WIDTH: usize = 9;
 pub const FONT_HEIGHT: usize = 16;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -17,10 +18,18 @@ pub struct Color {
 impl Color {
     pub const WHITE: Color = Color { r: 255, g: 255, b: 255 };
     pub const BLACK: Color = Color { r: 0, g: 0, b: 0 };
+    pub const DESKTOP: Color = Color { r: 0, g: 128, b: 128 };
+    pub const FACE: Color = Color { r: 192, g: 192, b: 192 };
+    pub const HIGHLIGHT: Color = Color { r: 255, g: 255, b: 255 };
+    pub const SHADOW: Color = Color { r: 128, g: 128, b: 128 };
+    pub const DARK: Color = Color { r: 0, g: 0, b: 0 };
+    pub const TITLE_ACTIVE: Color = Color { r: 0, g: 0, b: 128 };
+    pub const TITLE_INACTIVE: Color = Color { r: 128, g: 128, b: 128 };
+    pub const FIELD_BG: Color = Color { r: 255, g: 255, b: 255 };
+    pub const TEXT: Color = Color { r: 0, g: 0, b: 0 };
+    pub const TEXT_LIGHT: Color = Color { r: 255, g: 255, b: 255 };
 }
 
-/// Линейная интерполяция цвета по alpha (0..=255).
-/// alpha=255 → чистый fg, alpha=0 → чистый bg.
 fn blend(fg: Color, bg: Color, alpha: u8) -> Color {
     let a = alpha as u32;
     let inv = 255 - a;
@@ -32,29 +41,32 @@ fn blend(fg: Color, bg: Color, alpha: u8) -> Color {
 }
 
 pub struct Writer {
-    buffer: &'static mut [u8],
-    width: usize,
-    height: usize,
-    stride: usize,
-    bpp: usize,
-    format: PixelFormat,
-    cursor_x: usize,
-    cursor_y: usize,
-    fg: Color,
-    bg: Color,
+    back: Vec<u8>,
+    screen: &'static mut [u8],
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+    pub bpp: usize,
+    pub format: PixelFormat,
+    pub cursor_x: usize,
+    pub cursor_y: usize,
+    pub fg: Color,
+    pub bg: Color,
 }
 
 impl Writer {
     fn new(
-        buffer: &'static mut [u8],
+        screen: &'static mut [u8],
         width: usize,
         height: usize,
         stride: usize,
         bpp: usize,
         format: PixelFormat,
     ) -> Self {
+        let back_len = stride * height * bpp;
         Self {
-            buffer,
+            back: vec![0u8; back_len],
+            screen,
             width,
             height,
             stride,
@@ -62,72 +74,20 @@ impl Writer {
             format,
             cursor_x: 0,
             cursor_y: 0,
-            fg: Color::WHITE,
-            bg: Color::BLACK,
+            fg: Color::TEXT,
+            bg: Color::FACE,
         }
+    }
+
+    pub fn flush(&mut self) {
+        let len = self.screen.len().min(self.back.len());
+        self.screen[..len].copy_from_slice(&self.back[..len]);
     }
 
     pub fn clear(&mut self) {
-        for y in 0..self.height {
-            for x in 0..self.width {
-                self.set_pixel(x, y, self.bg);
-            }
-        }
+        self.fill_rect(0, 0, self.width, self.height, self.bg);
         self.cursor_x = 0;
         self.cursor_y = 0;
-    }
-
-    fn set_pixel(&mut self, x: usize, y: usize, color: Color) {
-        if x >= self.width || y >= self.height {
-            return;
-        }
-        let offset = y * self.stride * self.bpp + x * self.bpp;
-        match self.format {
-            PixelFormat::Rgb => {
-                self.buffer[offset] = color.r;
-                self.buffer[offset + 1] = color.g;
-                self.buffer[offset + 2] = color.b;
-            }
-            PixelFormat::Bgr => {
-                self.buffer[offset] = color.b;
-                self.buffer[offset + 1] = color.g;
-                self.buffer[offset + 2] = color.r;
-            }
-            PixelFormat::U8 => {
-                let gray = ((color.r as u32 + color.g as u32 + color.b as u32) / 3) as u8;
-                self.buffer[offset] = gray;
-            }
-            _ => {}
-        }
-    }
-
-    fn newline(&mut self) {
-        self.cursor_x = 0;
-        self.cursor_y += FONT_HEIGHT;
-        if self.cursor_y + FONT_HEIGHT > self.height {
-            self.scroll();
-        }
-    }
-
-    fn scroll(&mut self) {
-        let row_bytes = self.stride * self.bpp;
-        let shift = FONT_HEIGHT * row_bytes;
-        let total = self.height * row_bytes;
-
-        for i in 0..(total - shift) {
-            self.buffer[i] = self.buffer[i + shift];
-        }
-        for i in (total - shift)..total {
-            self.buffer[i] = 0;
-        }
-        if self.bg.r != 0 || self.bg.g != 0 || self.bg.b != 0 {
-            for y in (self.height - FONT_HEIGHT)..self.height {
-                for x in 0..self.width {
-                    self.set_pixel(x, y, self.bg);
-                }
-            }
-        }
-        self.cursor_y -= FONT_HEIGHT;
     }
 
     pub fn backspace(&mut self) {
@@ -141,6 +101,146 @@ impl Writer {
         }
     }
 
+    pub fn set_pixel(&mut self, x: usize, y: usize, color: Color) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let offset = y * self.stride * self.bpp + x * self.bpp;
+        match self.format {
+            PixelFormat::Rgb => {
+                self.back[offset] = color.r;
+                self.back[offset + 1] = color.g;
+                self.back[offset + 2] = color.b;
+            }
+            PixelFormat::Bgr => {
+                self.back[offset] = color.b;
+                self.back[offset + 1] = color.g;
+                self.back[offset + 2] = color.r;
+            }
+            PixelFormat::U8 => {
+                let gray = ((color.r as u32 + color.g as u32 + color.b as u32) / 3) as u8;
+                self.back[offset] = gray;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: Color) {
+        let x1 = (x + w).min(self.width);
+        let y1 = (y + h).min(self.height);
+        for yy in y..y1 {
+            for xx in x..x1 {
+                self.set_pixel(xx, yy, color);
+            }
+        }
+    }
+
+    pub fn draw_border(&mut self, x: usize, y: usize, w: usize, h: usize, thickness: usize, color: Color) {
+        self.fill_rect(x, y, w, thickness, color);
+        self.fill_rect(x, y + h - thickness, w, thickness, color);
+        self.fill_rect(x, y, thickness, h, color);
+        self.fill_rect(x + w - thickness, y, thickness, h, color);
+    }
+
+    /// Win95-фаска. raised=true — выпуклая, false — вдавленная.
+    pub fn bevel(&mut self, x: usize, y: usize, w: usize, h: usize, raised: bool) {
+        let (tl, br) = if raised {
+            (Color::HIGHLIGHT, Color::DARK)
+        } else {
+            (Color::SHADOW, Color::HIGHLIGHT)
+        };
+        self.fill_rect(x, y, w, 1, tl);
+        self.fill_rect(x, y, 1, h, tl);
+        self.fill_rect(x, y + h - 1, w, 1, br);
+        self.fill_rect(x + w - 1, y, 1, h, br);
+
+        let tl2 = if raised { Color::FACE } else { Color::SHADOW };
+        let br2 = if raised { Color::SHADOW } else { Color::FACE };
+        self.fill_rect(x + 1, y + 1, w - 2, 1, tl2);
+        self.fill_rect(x + 1, y + 1, 1, h - 2, tl2);
+        self.fill_rect(x + 1, y + h - 2, w - 2, 1, br2);
+        self.fill_rect(x + w - 2, y + 1, 1, h - 2, br2);
+    }
+
+    /// Вертикальный градиент.
+    pub fn gradient_v(&mut self, x: usize, y: usize, w: usize, h: usize, top: Color, bottom: Color) {
+        if h == 0 {
+            return;
+        }
+        let n = (h - 1) as u32;
+        for i in 0..h {
+            let t = i as u32;
+            let inv = n - t;
+            let c = if n == 0 {
+                top
+            } else {
+                Color {
+                    r: ((top.r as u32 * inv + bottom.r as u32 * t) / n) as u8,
+                    g: ((top.g as u32 * inv + bottom.g as u32 * t) / n) as u8,
+                    b: ((top.b as u32 * inv + bottom.b as u32 * t) / n) as u8,
+                }
+            };
+            self.fill_rect(x, y + i, w, 1, c);
+        }
+    }
+
+    /// Скруглённый прямоугольник (радиус в пикселях).
+    pub fn fill_round_rect(&mut self, x: usize, y: usize, w: usize, h: usize, radius: usize, color: Color) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        if w < 2 * radius || h < 2 * radius {
+            self.fill_rect(x, y, w, h, color);
+            return;
+        }
+        // Центральные полосы
+        self.fill_rect(x + radius, y, w - 2 * radius, h, color);
+        self.fill_rect(x, y + radius, radius, h - 2 * radius, color);
+        self.fill_rect(x + w - radius, y + radius, radius, h - 2 * radius, color);
+
+        // Углы — круги
+        let r2 = (radius * radius) as i32;
+        let ri = radius as i32;
+        for dy in 0..radius {
+            for dx in 0..radius {
+                let d2 = (dx as i32 - ri).pow(2) + (dy as i32 - ri).pow(2);
+                if d2 <= r2 {
+                    self.set_pixel(x + dx, y + dy, color);
+                    self.set_pixel(x + w - 1 - dx, y + dy, color);
+                    self.set_pixel(x + dx, y + h - 1 - dy, color);
+                    self.set_pixel(x + w - 1 - dx, y + h - 1 - dy, color);
+                }
+            }
+        }
+    }
+
+    pub fn draw_text_at(&mut self, x: usize, y: usize, s: &str, fg: Color, bg: Color) {
+        let sx = self.cursor_x;
+        let sy = self.cursor_y;
+        self.cursor_x = x;
+        self.cursor_y = y;
+        for c in s.chars() {
+            let code = c as u32;
+            if code < 0x20 || code > 0x7E {
+                self.cursor_x += FONT_WIDTH;
+                continue;
+            }
+            self.draw_char_colored(c, fg, bg);
+            self.cursor_x += FONT_WIDTH;
+        }
+        self.cursor_x = sx;
+        self.cursor_y = sy;
+    }
+
+    pub fn text_width(s: &str) -> usize {
+        s.chars().count() * FONT_WIDTH
+    }
+
+    fn newline(&mut self) {
+        self.cursor_x = 0;
+        self.cursor_y += FONT_HEIGHT;
+    }
+
     fn write_char(&mut self, c: char) {
         match c {
             '\n' => self.newline(),
@@ -148,21 +248,20 @@ impl Writer {
                 if self.cursor_x + FONT_WIDTH > self.width {
                     self.newline();
                 }
-                self.draw_char(c);
+                self.draw_char_colored(c, self.fg, self.bg);
                 self.cursor_x += FONT_WIDTH;
             }
         }
     }
 
-    fn draw_char(&mut self, c: char) {
+    fn draw_char_colored(&mut self, c: char, fg: Color, bg: Color) {
         let bitmap = match get_raster(c, FontWeight::Regular, RasterHeight::Size16) {
             Some(b) => b,
             None => return,
         };
         let w = bitmap.width();
         let h = bitmap.height();
-        let raster = bitmap.raster(); // &[&[u8]] — срез строк
-
+        let raster = bitmap.raster();
         for y in 0..h {
             let row = raster[y];
             for x in 0..w {
@@ -170,7 +269,7 @@ impl Writer {
                 if alpha == 0 {
                     continue;
                 }
-                let color = blend(self.fg, self.bg, alpha);
+                let color = blend(fg, bg, alpha);
                 self.set_pixel(self.cursor_x + x, self.cursor_y + y, color);
             }
         }
@@ -189,7 +288,7 @@ impl fmt::Write for Writer {
 static WRITER: Mutex<Option<Writer>> = Mutex::new(None);
 
 pub fn init(info: FrameBufferInfo, buffer: &'static mut [u8]) {
-    let writer = Writer::new(
+    let w = Writer::new(
         buffer,
         info.width,
         info.height,
@@ -197,27 +296,32 @@ pub fn init(info: FrameBufferInfo, buffer: &'static mut [u8]) {
         info.bytes_per_pixel,
         info.pixel_format,
     );
-    *WRITER.lock() = Some(writer);
+    *WRITER.lock() = Some(w);
+}
+
+pub fn with_writer<R, F: FnOnce(&mut Writer) -> R>(f: F) -> R {
+    let mut guard = WRITER.lock();
+    let w = guard.as_mut().expect("framebuffer не инициализирован");
+    f(w)
+}
+
+pub fn flush() {
+    with_writer(|w| w.flush());
 }
 
 pub fn clear() {
-    if let Some(w) = WRITER.lock().as_mut() {
-        w.clear();
-    }
+    with_writer(|w| w.clear());
 }
 
 pub fn backspace() {
-    if let Some(w) = WRITER.lock().as_mut() {
-        w.backspace();
-    }
+    with_writer(|w| w.backspace());
 }
 
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
-    let mut guard = WRITER.lock();
-    if let Some(w) = guard.as_mut() {
-        w.write_fmt(args).unwrap();
-    }
+    with_writer(|w| {
+        let _ = w.write_fmt(args);
+    });
 }
 
 #[macro_export]
