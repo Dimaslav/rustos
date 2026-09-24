@@ -1,0 +1,11 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bootloader_api = "0.11.17"
+
+[workspace]
+# Пустая секция [workspace] делает kernel отдельным workspace,
+# у него будет своя папка kernel/target/
