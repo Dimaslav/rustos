@@ -6,6 +6,9 @@ fn main() {
     let status = Command::new("qemu-system-x86_64")
         .args([
             "-drive", &format!("format=raw,file={}", bios_path),
+            "-serial", "stdio",
+            "-no-reboot",
+            "-no-shutdown",
             "-display", "gtk",
         ])
         .status()

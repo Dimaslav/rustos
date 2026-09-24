@@ -135,15 +135,23 @@ impl Writer {
         }
     }
 
-    pub fn draw_border(&mut self, x: usize, y: usize, w: usize, h: usize, thickness: usize, color: Color) {
-        self.fill_rect(x, y, w, thickness, color);
-        self.fill_rect(x, y + h - thickness, w, thickness, color);
-        self.fill_rect(x, y, thickness, h, color);
-        self.fill_rect(x + w - thickness, y, thickness, h, color);
+    /// Рамка. Underflow-safe.
+    pub fn draw_border(
+        &mut self,
+        x: usize, y: usize, w: usize, h: usize,
+        thickness: usize, color: Color,
+    ) {
+        if w == 0 || h == 0 || thickness == 0 { return; }
+        let t = thickness.min(w).min(h);
+        self.fill_rect(x, y, w, t, color);                     // top
+        self.fill_rect(x, y + h - t, w, t, color);             // bottom
+        self.fill_rect(x, y, t, h, color);                     // left
+        self.fill_rect(x + w - t, y, t, h, color);             // right
     }
 
-    /// Win95-фаска. raised=true — выпуклая, false — вдавленная.
+    /// Win95-фаска. Underflow-safe.
     pub fn bevel(&mut self, x: usize, y: usize, w: usize, h: usize, raised: bool) {
+        if w < 2 || h < 2 { return; }
         let (tl, br) = if raised {
             (Color::HIGHLIGHT, Color::DARK)
         } else {
@@ -154,19 +162,19 @@ impl Writer {
         self.fill_rect(x, y + h - 1, w, 1, br);
         self.fill_rect(x + w - 1, y, 1, h, br);
 
-        let tl2 = if raised { Color::FACE } else { Color::SHADOW };
-        let br2 = if raised { Color::SHADOW } else { Color::FACE };
-        self.fill_rect(x + 1, y + 1, w - 2, 1, tl2);
-        self.fill_rect(x + 1, y + 1, 1, h - 2, tl2);
-        self.fill_rect(x + 1, y + h - 2, w - 2, 1, br2);
-        self.fill_rect(x + w - 2, y + 1, 1, h - 2, br2);
+        if w > 2 && h > 2 {
+            let tl2 = if raised { Color::FACE } else { Color::SHADOW };
+            let br2 = if raised { Color::SHADOW } else { Color::FACE };
+            self.fill_rect(x + 1, y + 1, w - 2, 1, tl2);
+            self.fill_rect(x + 1, y + 1, 1, h - 2, tl2);
+            self.fill_rect(x + 1, y + h - 2, w - 2, 1, br2);
+            self.fill_rect(x + w - 2, y + 1, 1, h - 2, br2);
+        }
     }
 
     /// Вертикальный градиент.
     pub fn gradient_v(&mut self, x: usize, y: usize, w: usize, h: usize, top: Color, bottom: Color) {
-        if h == 0 {
-            return;
-        }
+        if h == 0 { return; }
         let n = (h - 1) as u32;
         for i in 0..h {
             let t = i as u32;
@@ -184,26 +192,25 @@ impl Writer {
         }
     }
 
-    /// Скруглённый прямоугольник (радиус в пикселях).
-    pub fn fill_round_rect(&mut self, x: usize, y: usize, w: usize, h: usize, radius: usize, color: Color) {
-        if w == 0 || h == 0 {
-            return;
-        }
+    /// Скруглённый прямоугольник.
+    pub fn fill_round_rect(
+        &mut self, x: usize, y: usize, w: usize, h: usize,
+        radius: usize, color: Color,
+    ) {
+        if w == 0 || h == 0 { return; }
         if w < 2 * radius || h < 2 * radius {
             self.fill_rect(x, y, w, h, color);
             return;
         }
-        // Центральные полосы
         self.fill_rect(x + radius, y, w - 2 * radius, h, color);
         self.fill_rect(x, y + radius, radius, h - 2 * radius, color);
         self.fill_rect(x + w - radius, y + radius, radius, h - 2 * radius, color);
 
-        // Углы — круги
-        let r2 = (radius * radius) as i32;
-        let ri = radius as i32;
+        let r = radius as i32;
+        let r2 = r * r;
         for dy in 0..radius {
             for dx in 0..radius {
-                let d2 = (dx as i32 - ri).pow(2) + (dy as i32 - ri).pow(2);
+                let d2 = (dx as i32 - r).pow(2) + (dy as i32 - r).pow(2);
                 if d2 <= r2 {
                     self.set_pixel(x + dx, y + dy, color);
                     self.set_pixel(x + w - 1 - dx, y + dy, color);
@@ -214,17 +221,13 @@ impl Writer {
         }
     }
 
+    /// Текст в произвольной позиции. Не-ASCII символы рисуются как '?'.
     pub fn draw_text_at(&mut self, x: usize, y: usize, s: &str, fg: Color, bg: Color) {
         let sx = self.cursor_x;
         let sy = self.cursor_y;
         self.cursor_x = x;
         self.cursor_y = y;
         for c in s.chars() {
-            let code = c as u32;
-            if code < 0x20 || code > 0x7E {
-                self.cursor_x += FONT_WIDTH;
-                continue;
-            }
             self.draw_char_colored(c, fg, bg);
             self.cursor_x += FONT_WIDTH;
         }
@@ -255,10 +258,10 @@ impl Writer {
     }
 
     fn draw_char_colored(&mut self, c: char, fg: Color, bg: Color) {
-        let bitmap = match get_raster(c, FontWeight::Regular, RasterHeight::Size16) {
-            Some(b) => b,
-            None => return,
-        };
+        let bitmap = get_raster(c, FontWeight::Regular, RasterHeight::Size16)
+            .or_else(|| get_raster('?', FontWeight::Regular, RasterHeight::Size16));
+        let bitmap = match bitmap { Some(b) => b, None => return };
+
         let w = bitmap.width();
         let h = bitmap.height();
         let raster = bitmap.raster();
@@ -266,9 +269,7 @@ impl Writer {
             let row = raster[y];
             for x in 0..w {
                 let alpha = row[x];
-                if alpha == 0 {
-                    continue;
-                }
+                if alpha == 0 { continue; }
                 let color = blend(fg, bg, alpha);
                 self.set_pixel(self.cursor_x + x, self.cursor_y + y, color);
             }

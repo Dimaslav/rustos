@@ -1,4 +1,3 @@
-use alloc::collections::VecDeque;
 use spin::Mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,15 +12,40 @@ pub enum Key {
     F(u8),
 }
 
+const RING: usize = 256;
+
+struct RingBuffer {
+    buf: [Option<Key>; RING],
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+impl RingBuffer {
+    const fn new() -> Self {
+        Self { buf: [None; RING], head: 0, tail: 0, len: 0 }
+    }
+    fn push(&mut self, k: Key) {
+        if self.len == RING { return; } // переполнение — теряем событие
+        self.buf[self.tail] = Some(k);
+        self.tail = (self.tail + 1) % RING;
+        self.len += 1;
+    }
+    fn pop(&mut self) -> Option<Key> {
+        if self.len == 0 { return None; }
+        let k = self.buf[self.head].take();
+        self.head = (self.head + 1) % RING;
+        self.len -= 1;
+        k
+    }
+}
+
 static MODS: Mutex<(bool, bool, bool)> = Mutex::new((false, false, false));
 static EXTENDED: Mutex<bool> = Mutex::new(false);
-
-pub static KEY_QUEUE: Mutex<VecDeque<Key>> = Mutex::new(VecDeque::new());
-pub static CHAR_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+static KEYS: Mutex<RingBuffer> = Mutex::new(RingBuffer::new());
 
 pub fn modifiers() -> (bool, bool, bool) { *MODS.lock() }
-pub fn pop() -> Option<Key> { KEY_QUEUE.lock().pop_front() }
-pub fn pop_char() -> Option<u8> { CHAR_QUEUE.lock().pop_front() }
+pub fn pop() -> Option<Key> { KEYS.lock().pop() }
 
 pub fn scancode_to_ascii(sc: u8, shift: bool) -> Option<u8> {
     let c = match sc {
@@ -120,13 +144,12 @@ pub fn handle(sc: u8) {
         _ => None,
     };
     if let Some(k) = key {
-        KEY_QUEUE.lock().push_back(k);
+        KEYS.lock().push(k);
         return;
     }
 
     let shift = MODS.lock().0;
     if let Some(c) = scancode_to_ascii(code, shift) {
-        KEY_QUEUE.lock().push_back(Key::Char(c));
-        CHAR_QUEUE.lock().push_back(c);
+        KEYS.lock().push(Key::Char(c));
     }
 }

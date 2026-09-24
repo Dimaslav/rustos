@@ -1,45 +1,90 @@
 use spin::Mutex;
+use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::instructions::port::Port;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MouseEvent {
-    pub x: i32,
-    pub y: i32,
-    pub left: bool,
-    pub right: bool,
+#[derive(Clone, Copy, Debug)]
+pub enum MouseButton {
+    Left,
+    Right,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct MouseState {
-    pub x: i32,
-    pub y: i32,
-    pub left: bool,
-    pub right: bool,
-    pub dirty: bool,
-    // Для debounce
-    pub last_click_tick: u64,
-    pub click_pending: bool,
+pub enum MouseEvent {
+    ButtonDown(MouseButton),
+    ButtonUp(MouseButton),
 }
 
-pub static MOUSE: Mutex<MouseState> = Mutex::new(MouseState {
-    x: 640,
-    y: 360,
-    left: false,
-    right: false,
-    dirty: true,
-    last_click_tick: 0,
-    click_pending: false,
-});
+const EV_CAP: usize = 32;
+
+struct EventQueue {
+    buf: [Option<MouseEvent>; EV_CAP],
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+impl EventQueue {
+    const fn new() -> Self {
+        Self { buf: [None; EV_CAP], head: 0, tail: 0, len: 0 }
+    }
+
+    fn push(&mut self, ev: MouseEvent) {
+        if self.len == EV_CAP {
+            return;
+        }
+        self.buf[self.tail] = Some(ev);
+        self.tail = (self.tail + 1) % EV_CAP;
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<MouseEvent> {
+        if self.len == 0 {
+            return None;
+        }
+        let ev = self.buf[self.head].take();
+        self.head = (self.head + 1) % EV_CAP;
+        self.len -= 1;
+        ev
+    }
+}
+
+static EVENTS: Mutex<EventQueue> = Mutex::new(EventQueue::new());
+static POS: Mutex<(i32, i32)> = Mutex::new((640, 360));
+static SCREEN: Mutex<(i32, i32)> = Mutex::new((1280, 720));
+
+pub fn set_screen(w: usize, h: usize) {
+    let w = (w as i32).max(1);
+    let h = (h as i32).max(1);
+    *SCREEN.lock() = (w, h);
+    let mut p = POS.lock();
+    p.0 = p.0.clamp(0, w - 1);
+    p.1 = p.1.clamp(0, h - 1);
+}
+
+/// Размеры экрана (ширина, высота).
+pub fn screen_size() -> (i32, i32) {
+    *SCREEN.lock()
+}
+
+/// Текущая позиция курсора.
+pub fn position() -> (i32, i32) {
+    without_interrupts(|| *POS.lock())
+}
+
+/// Забрать одно накопившееся событие кнопки.
+pub fn pop_event() -> Option<MouseEvent> {
+    without_interrupts(|| EVENTS.lock().pop())
+}
 
 struct Packet {
     bytes: [u8; 3],
     idx: usize,
+    prev_btn: u8,
 }
 
-static PACKET: Mutex<Packet> = Mutex::new(Packet {
-    bytes: [0; 3],
-    idx: 0,
-});
+static PACKET: Mutex<Packet> = Mutex::new(Packet { bytes: [0; 3], idx: 0, prev_btn: 0 });
+
+// ---------- Инициализация ----------
 
 unsafe fn wait_write() {
     let mut s: Port<u8> = Port::new(0x64);
@@ -82,7 +127,7 @@ pub unsafe fn init() {
     wait_read();
     let mut config = data.read();
 
-    config |= 0x02;    // включить IRQ12
+    config |= 0x02;    // IRQ12
     config &= !0x20;   // включить тактирование мыши
 
     wait_write();
@@ -96,56 +141,62 @@ pub unsafe fn init() {
     let _ = mouse_read();
 }
 
+// ---------- Обработка PS/2 пакета ----------
+
 pub fn push_byte(byte: u8) {
-    let mut pkt = PACKET.lock();
-    let idx = pkt.idx;
-    pkt.bytes[idx] = byte;
-    pkt.idx += 1;
+    // 1. Собираем пакет под одним коротким lock.
+    let (b, prev) = {
+        let mut pkt = PACKET.lock();
 
-    if pkt.idx < 3 { return; }
-    pkt.idx = 0;
-    let b = pkt.bytes;
-
-    if b[0] & 0x08 == 0 { return; }
-
-    let dx = b[1] as i32 - if b[0] & 0x10 != 0 { 256 } else { 0 };
-    let dy = b[2] as i32 - if b[0] & 0x20 != 0 { 256 } else { 0 };
-    let left = b[0] & 0x01 != 0;
-    let right = b[0] & 0x02 != 0;
-
-    let mut s = MOUSE.lock();
-
-    // Применяем смещение с фильтром: игнорируем мелкий шум
-    if dx.abs() > 0 || dy.abs() > 0 {
-        s.x = (s.x + dx).clamp(0, 1279);
-        s.y = (s.y - dy).clamp(0, 719);
-        s.dirty = true;
-    }
-
-    // Debounce нажатия: реагируем только на переход 0→1,
-    // но не чаще, чем раз в 5 тиков таймера (~275 мс).
-    if left && !s.left {
-        let now = crate::interrupts::ticks();
-        if now.saturating_sub(s.last_click_tick) >= 5 || s.last_click_tick == 0 {
-            s.last_click_tick = now;
-            s.click_pending = true;
+        // Ресинхронизация: у первого байта пакета bit 3 всегда 1.
+        if pkt.idx == 0 && (byte & 0x08) == 0 {
+            return;
         }
-        s.left = true;
-        s.dirty = true;
-    } else if !left && s.left {
-        s.left = false;
-        s.dirty = true;
-    }
-    s.right = right;
-}
 
-/// Забрать накопившийся «щелчок» (edge), если он есть.
-pub fn take_click() -> Option<(i32, i32, bool, bool)> {
-    let mut s = MOUSE.lock();
-    if s.click_pending {
-        s.click_pending = false;
-        Some((s.x, s.y, s.left, s.right))
-    } else {
-        None
+        let idx = pkt.idx;
+        pkt.bytes[idx] = byte;
+        pkt.idx += 1;
+
+        if pkt.idx < 3 {
+            return;
+        }
+        pkt.idx = 0;
+        (pkt.bytes, pkt.prev_btn)
+    };
+
+    // 2. Overflow (bits 6/7) — пакет битый.
+    if b[0] & 0xC0 != 0 {
+        return;
     }
+
+    let dx = if b[0] & 0x10 != 0 { b[1] as i32 - 256 } else { b[1] as i32 };
+    let dy = if b[0] & 0x20 != 0 { b[2] as i32 - 256 } else { b[2] as i32 };
+    let btn_bits = b[0] & 0x03;
+
+    // 3. Позиция.
+    {
+        let (sw, sh) = *SCREEN.lock();
+        let mut p = POS.lock();
+        p.0 = (p.0 + dx).clamp(0, sw - 1);
+        p.1 = (p.1 - dy).clamp(0, sh - 1);
+    }
+
+    // 4. Кнопки — edge-события в очередь.
+    let mut q = EVENTS.lock();
+    if (btn_bits & 0x01) != 0 && (prev & 0x01) == 0 {
+        q.push(MouseEvent::ButtonDown(MouseButton::Left));
+    }
+    if (btn_bits & 0x01) == 0 && (prev & 0x01) != 0 {
+        q.push(MouseEvent::ButtonUp(MouseButton::Left));
+    }
+    if (btn_bits & 0x02) != 0 && (prev & 0x02) == 0 {
+        q.push(MouseEvent::ButtonDown(MouseButton::Right));
+    }
+    if (btn_bits & 0x02) == 0 && (prev & 0x02) != 0 {
+        q.push(MouseEvent::ButtonUp(MouseButton::Right));
+    }
+    drop(q);
+
+    // 5. Запоминаем состояние кнопок.
+    PACKET.lock().prev_btn = btn_bits;
 }

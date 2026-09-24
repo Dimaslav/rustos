@@ -12,14 +12,16 @@ pub mod framebuffer;
 pub mod gui;
 pub mod interrupts;
 pub mod keyboard;
+pub mod memory;
 pub mod mouse;
-pub mod shell;
+pub mod serial;
 pub mod sound;
 pub mod widgets;
 
 use bootloader_api::config::Mapping;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
+use x86_64::VirtAddr;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -30,13 +32,22 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    let phys_offset = boot_info
-        .physical_memory_offset
-        .into_option()
-        .expect("physical_memory_offset не задан");
+    serial::init();
+    serial_println!("[boot] Rust OS v0.5");
 
-    // Heap — 4 МиБ, должно хватить даже на скромной конфигурации QEMU.
-    allocator::init_heap(&boot_info.memory_regions, phys_offset);
+    let phys_offset = VirtAddr::new(
+        boot_info
+            .physical_memory_offset
+            .into_option()
+            .expect("physical_memory_offset не задан"),
+    );
+    let mut mapper = unsafe { memory::init(phys_offset) };
+    let mut frame_allocator =
+        unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
+
+    allocator::init_heap(&mut mapper, &mut frame_allocator)
+        .expect("Ошибка инициализации кучи");
+    serial_println!("[boot] heap = {} bytes", allocator::HEAP_SIZE);
 
     let fb = boot_info
         .framebuffer
@@ -44,15 +55,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .expect("framebuffer отсутствует");
     let info = fb.info();
     let buffer = fb.buffer_mut();
-
     framebuffer::init(info, buffer);
+    serial_println!(
+        "[boot] framebuffer {}x{} {}bpp",
+        info.width, info.height, info.bytes_per_pixel
+    );
 
     interrupts::init();
+    serial_println!("[boot] interrupts ready");
 
-    gui::run();
+    serial_println!("[boot] entering GUI");
+    gui::run()
 }
 
-/// Пишем панику в VGA-текст (0xB8000) — работает даже до framebuffer::init.
 fn vga_panic_print(msg: &str) {
     const VGA: *mut u8 = 0xB8000 as *mut u8;
     let mut col = 0usize;
@@ -69,10 +84,10 @@ fn vga_panic_print(msg: &str) {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    vga_panic_print("PANIC! See framebuffer or serial.");
+    serial_println!("PANIC: {}", info);
+    vga_panic_print("PANIC! See serial for details.");
 
-    let loc = info.location();
-    if let Some(loc) = loc {
+    if let Some(loc) = info.location() {
         let mut buf = [0u8; 80];
         let mut n = 0usize;
         for b in b"at " { if n < buf.len() { buf[n] = *b; n += 1; } }
