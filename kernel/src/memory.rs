@@ -6,6 +6,9 @@ use x86_64::{
     PhysAddr, VirtAddr,
 };
 
+/// Первый мегабайт физической памяти трогать нельзя — там IVT, BDA, VGA и т.д.
+const LOW_MEM_LIMIT: u64 = 0x10_0000;
+
 /// Инициализирует новый `OffsetPageTable`.
 ///
 /// # Безопасность
@@ -16,7 +19,6 @@ pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static>
     OffsetPageTable::new(level_4_table, physical_memory_offset)
 }
 
-/// Возвращает мутабельную ссылку на активную таблицу страниц 4-го уровня.
 unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
     use x86_64::registers::control::Cr3;
 
@@ -28,10 +30,11 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
     &mut *page_table_ptr
 }
 
-/// Аллокатор физических фреймов, использующий карту памяти от загрузчика.
+/// Аллокатор физических фреймов с O(1) выделением.
 pub struct BootInfoFrameAllocator {
     memory_regions: &'static MemoryRegions,
-    next: usize,
+    next_region: usize,
+    next_addr: u64,
 }
 
 impl BootInfoFrameAllocator {
@@ -40,25 +43,65 @@ impl BootInfoFrameAllocator {
     /// # Безопасность
     /// Фреймы, помеченные как `Usable`, действительно не должны использоваться.
     pub unsafe fn init(memory_regions: &'static MemoryRegions) -> Self {
-        BootInfoFrameAllocator {
+        let mut a = Self {
             memory_regions,
-            next: 0,
-        }
+            next_region: 0,
+            next_addr: 0,
+        };
+        a.skip_to_next_usable();
+        crate::serial_println!(
+            "[mem] allocator init: next_region = {}, next_addr = {:#x}",
+            a.next_region,
+            a.next_addr
+        );
+        a
     }
 
-    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
-        let regions = self.memory_regions.iter();
-        let usable = regions.filter(|r| r.kind == MemoryRegionKind::Usable);
-        let ranges = usable.map(|r| r.start..r.end);
-        let frame_addrs = ranges.flat_map(|r| r.step_by(4096));
-        frame_addrs.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+    fn region_count(&self) -> usize {
+        self.memory_regions.iter().count()
+    }
+
+    /// Ищем следующий usable-регион, начиная с `next_region`, и ставим
+    /// `next_addr` на его начало (не ниже LOW_MEM_LIMIT), выровненное на 4096.
+    fn skip_to_next_usable(&mut self) {
+        let count = self.region_count();
+        while self.next_region < count {
+            let r = match self.memory_regions.iter().nth(self.next_region) {
+                Some(r) => r,
+                None => {
+                    self.next_region = count;
+                    return;
+                }
+            };
+            if r.kind == MemoryRegionKind::Usable {
+                let start = r.start.max(LOW_MEM_LIMIT);
+                let aligned = (start + 0xFFF) & !0xFFF;
+                if aligned + 4096 <= r.end {
+                    self.next_addr = aligned;
+                    return;
+                }
+            }
+            self.next_region += 1;
+        }
     }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let frame = self.usable_frames().nth(self.next);
-        self.next += 1;
-        frame
+        loop {
+            if self.next_region >= self.region_count() {
+                return None;
+            }
+            let r = self.memory_regions.iter().nth(self.next_region)?;
+            // Если следующий фрейм умещается в текущем регионе — отдаём его.
+            if self.next_addr + 4096 <= r.end {
+                let addr = self.next_addr;
+                self.next_addr += 4096;
+                return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
+            }
+            // Иначе — следующий регион.
+            self.next_region += 1;
+            self.skip_to_next_usable();
+        }
     }
 }

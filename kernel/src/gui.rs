@@ -2,16 +2,19 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::arch::asm;
 
+use crate::fat32::{Fat32, FatKind};
 use crate::framebuffer::{self, Color, Writer, FONT_HEIGHT};
-use crate::interrupts::{ticks, uptime_secs};
+use crate::fs::{self, FileSystem, NodeKind};
+use crate::interrupts::{ticks, uptime_secs, TIMER_HZ};
 use crate::keyboard::{self, Key};
 use crate::mouse::{self, MouseButton, MouseEvent};
 use crate::sound;
 use crate::widgets::{
     self, ACCENT, BUTTON_H, FIELD_H, MUTED, ROW_H, SURFACE_DARK, SURFACE_DARK_2, TEXT_LIGHT,
 };
+
+pub static DISK: spin::Mutex<Option<Fat32>> = spin::Mutex::new(None);
 
 const TITLE_H: usize = 30;
 const TASKBAR_H: usize = 42;
@@ -25,16 +28,58 @@ const ICON_X: usize = 32;
 const ICON_Y: usize = 32;
 const ICON_STEP: usize = 110;
 
+const EXP_TOOLBAR_H: usize = 38;
+const EXP_ROW_H: usize = 28;
+const EXP_SIDEBAR_W: usize = 160;
+
+#[derive(Clone)]
+enum ExplorerMode {
+    Browse,
+    NewFolder { name: String },
+    Rename { name: String },
+}
+
 #[derive(Clone)]
 enum App {
-    Notepad { text: String },
-    Todo { items: Vec<String>, selected: Option<usize>, input: String },
-    Calculator { display: String, a: f64, op: char, fresh: bool },
-    Paint { canvas: Vec<u8>, w: usize, h: usize, last: Option<(usize, usize)> },
+    Notepad {
+        text: String,
+        file: Option<String>,
+        modified: bool,
+    },
+    Explorer {
+        path: String,
+        selected: Option<usize>,
+        history: Vec<String>,
+        mode: ExplorerMode,
+        last_click: Option<(u64, usize)>,
+    },
+    Todo {
+        items: Vec<String>,
+        selected: Option<usize>,
+        input: String,
+    },
+    Calculator {
+        display: String,
+        a: f64,
+        op: char,
+        fresh: bool,
+    },
+    Paint {
+        canvas: Vec<u8>,
+        w: usize,
+        h: usize,
+        last: Option<(usize, usize)>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AppKind { Notepad, Todo, Calculator, Paint }
+enum AppKind {
+    Explorer,
+    Notepad,
+    Todo,
+    Calculator,
+    Paint,
+}
 
 struct Window {
     x: i32,
@@ -46,17 +91,23 @@ struct Window {
     minimized: bool,
 }
 
-struct Drag { idx: usize, ox: i32, oy: i32 }
+struct Drag {
+    idx: usize,
+    ox: i32,
+    oy: i32,
+}
 
 struct Wm {
     windows: Vec<Window>,
     active: usize,
+    fs: FileSystem,
     drag: Option<Drag>,
     painting: Option<usize>,
     start_pressed: bool,
     last_click: Option<(u64, AppKind)>,
     hover: (i32, i32),
     dirty: bool,
+    cursor_dirty: bool,
 }
 
 pub fn run() -> ! {
@@ -67,46 +118,71 @@ pub fn run() -> ! {
     let mut last_pos = mouse::position();
     wm.hover = last_pos;
     wm.dirty = true;
-    let mut last_clock_tick = ticks();
+    wm.cursor_dirty = false;
+    let mut last_stat_tick = ticks();
 
     loop {
         sound::tick();
 
-        // Coalesced Move: читаем только последнюю позицию. Не плодим события.
         let pos = mouse::position();
         if pos != last_pos {
             last_pos = pos;
             wm.on_move(pos.0, pos.1);
+            wm.cursor_dirty = true;
         }
 
-        // Button events — из очереди (edge).
         while let Some(ev) = mouse::pop_event() {
             match ev {
-                MouseEvent::ButtonDown(MouseButton::Left) => wm.on_button_down(pos.0, pos.1),
-                MouseEvent::ButtonUp(MouseButton::Left) => wm.on_button_up(pos.0, pos.1),
+                MouseEvent::ButtonDown(MouseButton::Left) => {
+                    wm.on_button_down(pos.0, pos.1);
+                    wm.dirty = true;
+                }
+                MouseEvent::ButtonUp(MouseButton::Left) => {
+                    wm.on_button_up(pos.0, pos.1);
+                    wm.dirty = true;
+                }
                 _ => {}
             }
         }
 
         while let Some(k) = keyboard::pop() {
-            let (_, _, alt) = keyboard::modifiers();
-            wm.on_key(k, alt);
-        }
-
-        // Часы — раз в 18 тиков (~1 сек), с хранением последнего тика.
-        let now = ticks();
-        if now.saturating_sub(last_clock_tick) >= 18 {
-            last_clock_tick = now;
+            let (_, ctrl, alt) = keyboard::modifiers();
+            wm.on_key(k, ctrl, alt);
             wm.dirty = true;
         }
 
-        if wm.dirty {
-            framebuffer::with_writer(|w| wm.draw(w));
-            framebuffer::flush();
-            wm.dirty = false;
+        let now = ticks();
+        if now.saturating_sub(last_stat_tick) >= TIMER_HZ {
+            last_stat_tick = now;
+            use core::sync::atomic::Ordering;
+            crate::serial_println!(
+                "[stat] tick={} irq_starts={} bytes_irq={} packets={}",
+                now,
+                mouse::IRQ_STARTS.load(Ordering::Relaxed),
+                mouse::BYTES_IRQ.load(Ordering::Relaxed),
+                mouse::PACKETS_DONE.load(Ordering::Relaxed),
+            );
         }
 
-        unsafe { asm!("hlt"); }
+        if wm.dirty {
+            framebuffer::with_writer(|w| {
+                wm.draw(w);
+                w.end_scene();
+                let _ = w.move_cursor(pos.0, pos.1, CURSOR);
+                w.flush_all();
+            });
+            wm.dirty = false;
+            wm.cursor_dirty = false;
+        } else if wm.cursor_dirty {
+            framebuffer::with_writer(|w| {
+                let (r1, r2) = w.move_cursor(pos.0, pos.1, CURSOR);
+                w.flush_rect(r1.0, r1.1, r1.2, r1.3);
+                w.flush_rect(r2.0, r2.1, r2.2, r2.3);
+            });
+            wm.cursor_dirty = false;
+        }
+
+        x86_64::instructions::interrupts::enable_and_hlt();
     }
 }
 
@@ -115,30 +191,22 @@ impl Wm {
         let mut wm = Wm {
             windows: Vec::new(),
             active: 0,
+            fs: FileSystem::new(),
             drag: None,
             painting: None,
             start_pressed: false,
             last_click: None,
             hover: mouse::position(),
             dirty: true,
+            cursor_dirty: false,
         };
-        wm.windows.push(Window {
-            x: 420,
-            y: 200,
-            w: 480,
-            h: 220,
-            title: "Welcome".to_string(),
-            content: App::Notepad {
-                text: "Rust OS v0.5\n\nDouble-click a desktop icon to open an app.\nAlt+Tab switches windows.\nAlt+F4 closes the active window.\n\nDrag the title bar to move a window.".to_string(),
-            },
-            minimized: false,
-        });
-        wm.active = 0;
+        wm.open_app(AppKind::Explorer);
         wm
     }
 
-    fn icons() -> [(AppKind, &'static str, char, Color); 4] {
+    fn icons() -> [(AppKind, &'static str, char, Color); 5] {
         [
+            (AppKind::Explorer,   "Files",      'F', Color { r: 255, g: 195, b: 70 }),
             (AppKind::Notepad,    "Notepad",    'N', Color { r: 100, g: 150, b: 255 }),
             (AppKind::Todo,       "Tasks",      'T', Color { r: 80,  g: 200, b: 120 }),
             (AppKind::Calculator, "Calculator", 'C', Color { r: 240, g: 150, b: 60  }),
@@ -178,7 +246,8 @@ impl Wm {
         for (i, w) in self.windows.iter().enumerate() {
             let m = matches!(
                 (&w.content, kind),
-                (App::Notepad { .. }, AppKind::Notepad)
+                (App::Explorer { .. }, AppKind::Explorer)
+                    | (App::Notepad { .. }, AppKind::Notepad)
                     | (App::Todo { .. }, AppKind::Todo)
                     | (App::Calculator { .. }, AppKind::Calculator)
                     | (App::Paint { .. }, AppKind::Paint)
@@ -189,11 +258,54 @@ impl Wm {
                 return;
             }
         }
+        self.spawn_app(kind, None);
+    }
 
-        let (title, content) = match kind {
-            AppKind::Notepad => ("Notepad", App::Notepad { text: String::new() }),
+    fn open_notepad_with_file(&mut self, path: String) {
+        let content = self
+            .fs
+            .read(&path)
+            .map(|v| String::from_utf8_lossy(&v).to_string())
+            .unwrap_or_default();
+        self.spawn_app(AppKind::Notepad, Some((path, content)));
+    }
+
+    fn spawn_app(&mut self, kind: AppKind, notepad_data: Option<(String, String)>) {
+        let (title, content): (String, App) = match kind {
+            AppKind::Explorer => (
+                "File Explorer".to_string(),
+                App::Explorer {
+                    path: "/".to_string(),
+                    selected: None,
+                    history: Vec::new(),
+                    mode: ExplorerMode::Browse,
+                    last_click: None,
+                },
+            ),
+            AppKind::Notepad => {
+                if let Some((file, text)) = notepad_data {
+                    let title = file.rsplit('/').next().unwrap_or("Notepad").to_string();
+                    (
+                        title,
+                        App::Notepad {
+                            text,
+                            file: Some(file),
+                            modified: false,
+                        },
+                    )
+                } else {
+                    (
+                        "Notepad".to_string(),
+                        App::Notepad {
+                            text: String::new(),
+                            file: None,
+                            modified: false,
+                        },
+                    )
+                }
+            }
             AppKind::Todo => (
-                "Tasks",
+                "Tasks".to_string(),
                 App::Todo {
                     items: vec!["Write UI".to_string(), "Add sound".to_string()],
                     selected: None,
@@ -201,22 +313,34 @@ impl Wm {
                 },
             ),
             AppKind::Calculator => (
-                "Calculator",
-                App::Calculator { display: "0".to_string(), a: 0.0, op: ' ', fresh: true },
+                "Calculator".to_string(),
+                App::Calculator {
+                    display: "0".to_string(),
+                    a: 0.0,
+                    op: ' ',
+                    fresh: true,
+                },
             ),
             AppKind::Paint => (
-                "Paint",
-                App::Paint { canvas: vec![255u8; 320 * 200 * 3], w: 320, h: 200, last: None },
+                "Paint".to_string(),
+                App::Paint {
+                    canvas: vec![255u8; 320 * 200 * 3],
+                    w: 320,
+                    h: 200,
+                    last: None,
+                },
             ),
         };
 
+        let (ww, wh) = if kind == AppKind::Explorer { (720, 460) } else { (500, 340) };
+
         let off = self.windows.len() as i32 * 28;
         self.windows.push(Window {
-            x: 140 + off,
-            y: 90 + off,
-            w: 500,
-            h: 340,
-            title: title.to_string(),
+            x: 100 + off,
+            y: 70 + off,
+            w: ww,
+            h: wh,
+            title,
             content,
             minimized: false,
         });
@@ -224,8 +348,6 @@ impl Wm {
         self.dirty = true;
         sound::open();
     }
-
-    // ---------- Mouse ----------
 
     fn on_move(&mut self, x: i32, y: i32) {
         self.hover = (x, y);
@@ -317,11 +439,7 @@ impl Wm {
                     let i = self.active;
                     self.windows[i].minimized = true;
                 } else {
-                    self.drag = Some(Drag {
-                        idx: self.active,
-                        ox: x - wx,
-                        oy: y - wy,
-                    });
+                    self.drag = Some(Drag { idx: self.active, ox: x - wx, oy: y - wy });
                 }
             } else {
                 self.handle_content_click(x, y);
@@ -335,9 +453,7 @@ impl Wm {
         self.dirty = true;
     }
 
-    // ---------- Keyboard ----------
-
-    fn on_key(&mut self, k: Key, alt: bool) {
+    fn on_key(&mut self, k: Key, ctrl: bool, alt: bool) {
         if alt && k == Key::Tab && !self.windows.is_empty() {
             let next = (self.active + 1) % self.windows.len();
             self.focus_window(next);
@@ -348,6 +464,14 @@ impl Wm {
             return;
         }
         if k == Key::Escape {
+            let idx = self.active;
+            if let App::Explorer { mode, .. } = &mut self.windows[idx].content {
+                if !matches!(mode, ExplorerMode::Browse) {
+                    *mode = ExplorerMode::Browse;
+                    self.dirty = true;
+                    return;
+                }
+            }
             self.start_pressed = false;
             self.dirty = true;
             return;
@@ -360,13 +484,102 @@ impl Wm {
         self.dirty = true;
 
         match &mut win.content {
-            App::Notepad { text } => match k {
-                Key::Enter => text.push('\n'),
-                Key::Backspace => { text.pop(); }
-                Key::Tab => text.push_str("    "),
-                Key::Char(c) => text.push(c as char),
+            App::Notepad { text, file: _, modified } => match k {
+                Key::Enter => { text.push('\n'); *modified = true; }
+                Key::Backspace => { text.pop(); *modified = true; }
+                Key::Tab => { text.push_str("    "); *modified = true; }
+                Key::Char(c) => { text.push(c as char); *modified = true; }
                 _ => {}
             },
+            App::Explorer { path, selected, history, mode, .. } => {
+                match mode {
+                    ExplorerMode::NewFolder { name } => match k {
+                        Key::Enter => {
+                            let n = name.clone();
+                            let p = path.clone();
+                            if !n.is_empty() && self.fs.mkdir(&p, &n) {
+                                *mode = ExplorerMode::Browse;
+                            }
+                        }
+                        Key::Backspace => { name.pop(); }
+                        Key::Char(c) => name.push(c as char),
+                        _ => {}
+                    },
+                    ExplorerMode::Rename { name } => match k {
+                        Key::Enter => {
+                            let n = name.clone();
+                            let p = path.clone();
+                            let sel = *selected;
+                            if let Some(i) = sel {
+                                let entries = self.fs.list(&p);
+                                if i < entries.len() {
+                                    let full = fs::join(&p, &entries[i].name);
+                                    if self.fs.rename(&full, &n) {
+                                        *mode = ExplorerMode::Browse;
+                                    }
+                                }
+                            }
+                        }
+                        Key::Backspace => { name.pop(); }
+                        Key::Char(c) => name.push(c as char),
+                        _ => {}
+                    },
+                    ExplorerMode::Browse => {
+                        match k {
+                            Key::Backspace => {
+                                let cur = path.clone();
+                                if cur != "/" && !cur.starts_with("C:") {
+                                    let parent = fs::parent_path(&cur);
+                                    history.push(cur);
+                                    *path = parent;
+                                    *selected = None;
+                                }
+                            }
+                            Key::Enter => {
+                                if let Some(i) = *selected {
+                                    let entries = self.fs.list(path);
+                                    if let Some(e) = entries.get(i) {
+                                        let full = fs::join(path, &e.name);
+                                        if e.kind == NodeKind::Directory {
+                                            history.push(path.clone());
+                                            *path = full;
+                                            *selected = None;
+                                        }
+                                    }
+                                }
+                            }
+                            Key::Delete => {
+                                if !path.starts_with("C:") {
+                                    if let Some(i) = *selected {
+                                        let entries = self.fs.list(path);
+                                        if let Some(e) = entries.get(i) {
+                                            let full = fs::join(path, &e.name);
+                                            self.fs.remove(&full);
+                                            *selected = None;
+                                        }
+                                    }
+                                }
+                            }
+                            Key::F(2) => {
+                                if !path.starts_with("C:") {
+                                    if let Some(i) = *selected {
+                                        let entries = self.fs.list(path);
+                                        if let Some(e) = entries.get(i) {
+                                            *mode = ExplorerMode::Rename { name: e.name.clone() };
+                                        }
+                                    }
+                                }
+                            }
+                            Key::Char(c) if ctrl && (c == b'n' || c == b'N') => {
+                                if !path.starts_with("C:") {
+                                    *mode = ExplorerMode::NewFolder { name: String::new() };
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             App::Todo { items, input, .. } => match k {
                 Key::Enter => {
                     let s = input.trim();
@@ -388,8 +601,6 @@ impl Wm {
             App::Paint { .. } => {}
         }
     }
-
-    // ---------- Application logic ----------
 
     fn calc_input(&mut self, ch: char) {
         let win = &mut self.windows[self.active];
@@ -439,13 +650,19 @@ impl Wm {
 
     fn handle_content_click(&mut self, mx: i32, my: i32) {
         let active = self.active;
+        let is_explorer = matches!(&self.windows[active].content, App::Explorer { .. });
+        if is_explorer {
+            self.handle_explorer_click(mx, my);
+            return;
+        }
+
         let win = &mut self.windows[active];
         let wx = win.x.max(0) as usize;
         let wy = win.y.max(0) as usize;
 
         match &mut win.content {
             App::Notepad { .. } => {}
-
+            App::Explorer { .. } => unreachable!(),
             App::Todo { items, selected, input } => {
                 let pad = 16;
                 let field_x = wx + pad;
@@ -460,17 +677,12 @@ impl Wm {
 
                 if widgets::hit(mx, my, add_btn_x, field_y, 72, FIELD_H) {
                     let s = input.trim();
-                    if !s.is_empty() {
-                        items.push(s.to_string());
-                        input.clear();
-                    }
+                    if !s.is_empty() { items.push(s.to_string()); input.clear(); }
                     return;
                 }
                 if widgets::hit(mx, my, list_x, remove_btn_y, 120, BUTTON_H) {
                     if let Some(sel) = selected.take() {
-                        if sel < items.len() {
-                            items.remove(sel);
-                        }
+                        if sel < items.len() { items.remove(sel); }
                     }
                     return;
                 }
@@ -480,7 +692,6 @@ impl Wm {
                     *selected = if row < items.len() { Some(row) } else { None };
                 }
             }
-
             App::Calculator { .. } => {
                 let layout = calc_layout(win);
                 let (bx, by) = (layout.grid_x, layout.grid_y);
@@ -509,7 +720,6 @@ impl Wm {
                     }
                 }
             }
-
             App::Paint { canvas, w, h, last } => {
                 let pad = 10;
                 let cx = wx + pad;
@@ -531,6 +741,253 @@ impl Wm {
                 }
             }
         }
+    }
+
+    fn handle_explorer_click(&mut self, mx: i32, my: i32) {
+        let idx = self.active;
+        let win = &mut self.windows[idx];
+        let wx = win.x.max(0) as usize;
+        let wy = win.y.max(0) as usize;
+        let ww = win.w;
+
+        let toolbar_y = wy + TITLE_H + 8;
+        let body_y = toolbar_y + EXP_TOOLBAR_H + 8;
+
+        let back_x = wx + 10;
+        let up_x = back_x + 48;
+        let nf_x = up_x + 48;
+        let del_x = nf_x + 90;
+        let ren_x = del_x + 80;
+
+        // Диалог открыт? Клик отменяет.
+        let is_dialog_open = matches!(
+            &self.windows[idx].content,
+            App::Explorer { mode, .. } if !matches!(mode, ExplorerMode::Browse)
+        );
+        if is_dialog_open {
+            if let App::Explorer { mode, .. } = &mut self.windows[idx].content {
+                *mode = ExplorerMode::Browse;
+            }
+            self.dirty = true;
+            return;
+        }
+
+        // ---- Toolbar ----
+        if (my as usize) >= toolbar_y && (my as usize) < toolbar_y + EXP_TOOLBAR_H {
+            if widgets::hit(mx, my, back_x, toolbar_y, 42, EXP_TOOLBAR_H) {
+                if let App::Explorer { path, history, selected, .. } = &mut self.windows[idx].content {
+                    if let Some(prev) = history.pop() {
+                        *path = prev;
+                        *selected = None;
+                    }
+                }
+                self.dirty = true;
+                return;
+            }
+            if widgets::hit(mx, my, up_x, toolbar_y, 42, EXP_TOOLBAR_H) {
+                if let App::Explorer { path, history, selected, .. } = &mut self.windows[idx].content {
+                    let cur = path.clone();
+                    if cur != "/" && !cur.starts_with("C:") {
+                        let parent = fs::parent_path(&cur);
+                        history.push(cur);
+                        *path = parent;
+                        *selected = None;
+                    }
+                }
+                self.dirty = true;
+                return;
+            }
+            if widgets::hit(mx, my, nf_x, toolbar_y, 86, EXP_TOOLBAR_H) {
+                let on_disk = matches!(&self.windows[idx].content, App::Explorer { path, .. } if path.starts_with("C:"));
+                if !on_disk {
+                    if let App::Explorer { mode, .. } = &mut self.windows[idx].content {
+                        *mode = ExplorerMode::NewFolder { name: String::new() };
+                    }
+                }
+                self.dirty = true;
+                return;
+            }
+            if widgets::hit(mx, my, del_x, toolbar_y, 76, EXP_TOOLBAR_H) {
+                let on_disk = matches!(&self.windows[idx].content, App::Explorer { path, .. } if path.starts_with("C:"));
+                if !on_disk {
+                    let p = match &self.windows[idx].content {
+                        App::Explorer { path, .. } => path.clone(),
+                        _ => return,
+                    };
+                    let sel = match &self.windows[idx].content {
+                        App::Explorer { selected, .. } => *selected,
+                        _ => None,
+                    };
+                    if let Some(i) = sel {
+                        let entries = self.fs.list(&p);
+                        if let Some(e) = entries.get(i) {
+                            let full = fs::join(&p, &e.name);
+                            self.fs.remove(&full);
+                            if let App::Explorer { selected, .. } = &mut self.windows[idx].content {
+                                *selected = None;
+                            }
+                        }
+                    }
+                }
+                self.dirty = true;
+                return;
+            }
+            if widgets::hit(mx, my, ren_x, toolbar_y, 76, EXP_TOOLBAR_H) {
+                let on_disk = matches!(&self.windows[idx].content, App::Explorer { path, .. } if path.starts_with("C:"));
+                if !on_disk {
+                    let p = match &self.windows[idx].content {
+                        App::Explorer { path, .. } => path.clone(),
+                        _ => return,
+                    };
+                    let sel = match &self.windows[idx].content {
+                        App::Explorer { selected, .. } => *selected,
+                        _ => None,
+                    };
+                    if let Some(i) = sel {
+                        let entries = self.fs.list(&p);
+                        if let Some(e) = entries.get(i) {
+                            if let App::Explorer { mode, .. } = &mut self.windows[idx].content {
+                                *mode = ExplorerMode::Rename { name: e.name.clone() };
+                            }
+                        }
+                    }
+                }
+                self.dirty = true;
+                return;
+            }
+            return;
+        }
+
+        // ---- Sidebar ----
+        let sidebar_x = wx + 10;
+        let sidebar_w = EXP_SIDEBAR_W;
+        if (mx as usize) >= sidebar_x
+            && (mx as usize) < sidebar_x + sidebar_w
+            && (my as usize) >= body_y
+        {
+            let items: [(&str, &str); 6] = [
+                ("Home", "/"),
+                ("Desktop", "/Desktop"),
+                ("Documents", "/Documents"),
+                ("Downloads", "/Downloads"),
+                ("System", "/System"),
+                ("Disk (C:)", "C:/"),
+            ];
+            for (i, (_, p)) in items.iter().enumerate() {
+                let ry = body_y + 14 + i * 30;
+                if (my as usize) >= ry && (my as usize) < ry + 26 {
+                    if let App::Explorer { path, history, selected, .. } = &mut self.windows[idx].content {
+                        let cur = path.clone();
+                        if cur != *p {
+                            history.push(cur);
+                            *path = p.to_string();
+                            *selected = None;
+                        }
+                    }
+                    self.dirty = true;
+                    return;
+                }
+            }
+            return;
+        }
+
+        // ---- File view ----
+        let view_x = wx + sidebar_w + 20;
+        let view_y = body_y;
+        let view_w = ww.saturating_sub(sidebar_w + 30);
+
+        if (mx as usize) >= view_x
+            && (mx as usize) < view_x + view_w
+            && (my as usize) >= view_y + 34
+        {
+            let rel_y = (my as usize) - (view_y + 34);
+            let row = rel_y / EXP_ROW_H;
+
+            let p = match &self.windows[idx].content {
+                App::Explorer { path, .. } => path.clone(),
+                _ => return,
+            };
+
+            // Пользуемся общей функцией list_dir_entries, чтобы не дублировать.
+            let entries = self.list_dir_entries(&p);
+
+            if row < entries.len() {
+                let now = ticks();
+                let dbl = if let App::Explorer { last_click, .. } = &self.windows[idx].content {
+                    matches!(last_click, Some((t, r)) if *r == row && now.saturating_sub(*t) < 30)
+                } else {
+                    false
+                };
+
+                if let App::Explorer { selected, last_click, .. } = &mut self.windows[idx].content {
+                    *selected = Some(row);
+                    *last_click = Some((now, row));
+                }
+
+                if dbl {
+                    let (name, is_dir, _) = entries[row].clone();
+                    if is_dir {
+                        if let App::Explorer { path, history, selected, last_click, .. } = &mut self.windows[idx].content {
+                            history.push(path.clone());
+                            if p == "C:/" {
+                                // В подкаталог диска пока не умеем — просто в корень.
+                                *path = "C:/".to_string();
+                            } else {
+                                *path = fs::join(&p, &name);
+                            }
+                            *selected = None;
+                            *last_click = None;
+                        }
+                    } else if name.ends_with(".txt") || name.ends_with(".TXT") {
+                        // Если мы на диске — читаем через FAT, иначе через RAMFS.
+                        if p.starts_with("C:") {
+                            if let Some(text) = self.read_disk_file(&name) {
+                                self.spawn_app(AppKind::Notepad, Some((alloc::format!("C:/{}", name), text)));
+                            }
+                        } else {
+                            let full = fs::join(&p, &name);
+                            self.open_notepad_with_file(full);
+                        }
+                    }
+                }
+                self.dirty = true;
+            } else {
+                if let App::Explorer { selected, .. } = &mut self.windows[idx].content {
+                    *selected = None;
+                }
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Список содержимого директории: (имя, is_dir, size).
+    fn list_dir_entries(&mut self, path: &str) -> Vec<(String, bool, u32)> {
+        if path.starts_with("C:") {
+            let mut guard = DISK.lock();
+            if let Some(fat) = guard.as_mut() {
+                fat.list_root()
+                    .into_iter()
+                    .map(|e| (e.name, e.kind == FatKind::Directory, e.size))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            self.fs
+                .list(path)
+                .into_iter()
+                .map(|e| (e.name, e.kind == NodeKind::Directory, e.size as u32))
+                .collect()
+        }
+    }
+
+    fn read_disk_file(&mut self, name: &str) -> Option<String> {
+        let mut guard = DISK.lock();
+        let fat = guard.as_mut()?;
+        let entries = fat.list_root();
+        let entry = entries.into_iter().find(|e| e.name.eq_ignore_ascii_case(name))?;
+        let data = fat.read_file(&entry);
+        Some(String::from_utf8_lossy(&data).to_string())
     }
 
     fn paint_at(&mut self, idx: usize, mx: i32, my: i32) {
@@ -571,8 +1028,6 @@ impl Wm {
         }
     }
 
-    // ---------- Drawing ----------
-
     fn draw(&self, w: &mut Writer) {
         w.gradient_v(0, 0, w.width, w.height, WALLPAPER_TOP, WALLPAPER_BOTTOM);
 
@@ -595,9 +1050,6 @@ impl Wm {
         if self.start_pressed {
             self.draw_start_menu(w);
         }
-
-        let (mx, my) = mouse::position();
-        draw_cursor(w, mx, my);
     }
 
     fn draw_window(&self, w: &mut Writer, win: &Window, active: bool) {
@@ -627,7 +1079,12 @@ impl Wm {
         self.draw_min_btn(w, mb_x, cb_y);
 
         match &win.content {
-            App::Notepad { text } => self.draw_notepad(w, win, text),
+            App::Notepad { text, file, modified } => {
+                self.draw_notepad(w, win, text, file.as_deref(), *modified)
+            }
+            App::Explorer { path, selected, mode, .. } => {
+                self.draw_explorer(w, win, path, *selected, mode)
+            }
             App::Todo { items, selected, input } => {
                 self.draw_todo(w, win, items, *selected, input)
             }
@@ -640,11 +1097,7 @@ impl Wm {
 
     fn draw_close_btn(&self, w: &mut Writer, x: usize, y: usize) {
         let hover = widgets::hit(self.hover.0, self.hover.1, x, y, CLOSE_BTN_W, 20);
-        let bg = if hover {
-            Color { r: 232, g: 68, b: 68 }
-        } else {
-            SURFACE_DARK_2
-        };
+        let bg = if hover { Color { r: 232, g: 68, b: 68 } } else { SURFACE_DARK_2 };
         w.fill_round_rect(x, y, CLOSE_BTN_W, 20, 6, bg);
         let cx = x + CLOSE_BTN_W / 2;
         let cy = y + 10;
@@ -654,18 +1107,21 @@ impl Wm {
 
     fn draw_min_btn(&self, w: &mut Writer, x: usize, y: usize) {
         let hover = widgets::hit(self.hover.0, self.hover.1, x, y, MIN_BTN_W, 20);
-        let bg = if hover {
-            Color { r: 80, g: 90, b: 110 }
-        } else {
-            SURFACE_DARK_2
-        };
+        let bg = if hover { Color { r: 80, g: 90, b: 110 } } else { SURFACE_DARK_2 };
         w.fill_round_rect(x, y, MIN_BTN_W, 20, 6, bg);
         let cx = x + MIN_BTN_W / 2;
         let cy = y + 12;
         w.fill_rect(cx - 4, cy, 8, 2, TEXT_LIGHT);
     }
 
-    fn draw_notepad(&self, w: &mut Writer, win: &Window, text: &str) {
+    fn draw_notepad(
+        &self,
+        w: &mut Writer,
+        win: &Window,
+        text: &str,
+        file: Option<&str>,
+        modified: bool,
+    ) {
         let x = win.x.max(0) as usize;
         let y = win.y.max(0) as usize;
         let pad = 14;
@@ -701,6 +1157,151 @@ impl Wm {
             );
             col += 1;
         }
+
+        let status = match (file, modified) {
+            (Some(f), true) => format!("{} *", f),
+            (Some(f), false) => f.to_string(),
+            (None, _) => "(unsaved)".to_string(),
+        };
+        w.draw_text_at(
+            field_x + 4,
+            y + win.h.saturating_sub(14),
+            &status,
+            MUTED,
+            SURFACE_DARK,
+        );
+    }
+
+    fn draw_explorer(
+        &self,
+        w: &mut Writer,
+        win: &Window,
+        path: &str,
+        selected: Option<usize>,
+        mode: &ExplorerMode,
+    ) {
+        let x = win.x.max(0) as usize;
+        let y = win.y.max(0) as usize;
+        let ww = win.w;
+        let wh = win.h;
+
+        // ---- Toolbar ----
+        let toolbar_y = y + TITLE_H + 8;
+        let back_x = x + 10;
+        let up_x = back_x + 48;
+        let nf_x = up_x + 48;
+        let del_x = nf_x + 90;
+        let ren_x = del_x + 80;
+
+        widgets::button_modern(w, back_x, toolbar_y, 42, EXP_TOOLBAR_H, "<", SURFACE_DARK_2, TEXT_LIGHT, false);
+        widgets::button_modern(w, up_x, toolbar_y, 42, EXP_TOOLBAR_H, "^", SURFACE_DARK_2, TEXT_LIGHT, false);
+        widgets::button_modern(w, nf_x, toolbar_y, 86, EXP_TOOLBAR_H, "+ Folder", SURFACE_DARK_2, TEXT_LIGHT, false);
+        widgets::button_modern(w, del_x, toolbar_y, 76, EXP_TOOLBAR_H, "Delete", SURFACE_DARK_2, TEXT_LIGHT, false);
+        widgets::button_modern(w, ren_x, toolbar_y, 76, EXP_TOOLBAR_H, "Rename", SURFACE_DARK_2, TEXT_LIGHT, false);
+
+        // ---- Address bar ----
+        let addr_x = ren_x + 86;
+        let addr_w = (x + ww).saturating_sub(addr_x + 12);
+        w.fill_round_rect(addr_x, toolbar_y + 4, addr_w, EXP_TOOLBAR_H - 8, 5, SURFACE_DARK_2);
+        w.draw_text_at(
+            addr_x + 10,
+            toolbar_y + 4 + (EXP_TOOLBAR_H - 8 - FONT_HEIGHT) / 2,
+            path,
+            TEXT_LIGHT,
+            SURFACE_DARK_2,
+        );
+
+        // ---- Body ----
+        let body_y = toolbar_y + EXP_TOOLBAR_H + 8;
+        let body_h = (y + wh).saturating_sub(body_y + 12);
+
+        let sidebar_x = x + 10;
+        w.fill_round_rect(sidebar_x, body_y, EXP_SIDEBAR_W, body_h, 6, SURFACE_DARK_2);
+        let items: [&str; 6] = ["Home", "Desktop", "Documents", "Downloads", "System", "Disk (C:)"];
+        for (i, name) in items.iter().enumerate() {
+            let ry = body_y + 14 + i * 30;
+            let active_here = (name == &"Disk (C:)" && path.starts_with("C:"))
+                || (name == &"Home" && path == "/");
+            let fg = if active_here { ACCENT } else { TEXT_LIGHT };
+            w.draw_text_at(sidebar_x + 12, ry + 5, name, fg, SURFACE_DARK_2);
+        }
+
+        // ---- File view ----
+        let view_x = x + EXP_SIDEBAR_W + 20;
+        let view_y = body_y;
+        let view_w = ww.saturating_sub(EXP_SIDEBAR_W + 30);
+        let view_h = body_h;
+        let view_bg = Color { r: 37, g: 40, b: 48 };
+        w.fill_round_rect(view_x, view_y, view_w, view_h, 6, view_bg);
+
+        w.draw_text_at(view_x + 14, view_y + 10, "Name", MUTED, view_bg);
+        w.draw_text_at(view_x + view_w.saturating_sub(100), view_y + 10, "Size", MUTED, view_bg);
+
+        // Получаем список — либо из FAT, либо из RAMFS.
+        let entries: Vec<(String, bool, u32)> = if path.starts_with("C:") {
+            let mut guard = DISK.lock();
+            if let Some(fat) = guard.as_mut() {
+                fat.list_root()
+                    .into_iter()
+                    .map(|e| (e.name, e.kind == FatKind::Directory, e.size))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            self.fs
+                .list(path)
+                .into_iter()
+                .map(|e| (e.name, e.kind == NodeKind::Directory, e.size as u32))
+                .collect()
+        };
+
+        for (i, (name, is_dir, size)) in entries.iter().enumerate() {
+            let ry = view_y + 34 + i * EXP_ROW_H;
+            if ry + EXP_ROW_H >= view_y + view_h { break; }
+            let sel = selected == Some(i);
+            let bg = if sel { ACCENT } else { view_bg };
+            if sel {
+                w.fill_round_rect(view_x + 6, ry, view_w.saturating_sub(12), EXP_ROW_H - 2, 5, bg);
+            }
+            let icon = if *is_dir { "[D]" } else { "[F]" };
+            w.draw_text_at(view_x + 12, ry + 5, icon, TEXT_LIGHT, bg);
+            w.draw_text_at(view_x + 48, ry + 5, name, TEXT_LIGHT, bg);
+            if !*is_dir {
+                let sz = format!("{} B", size);
+                w.draw_text_at(view_x + view_w.saturating_sub(100), ry + 5, &sz, MUTED, bg);
+            }
+        }
+
+        // ---- Dialog ----
+        let dlg = match mode {
+            ExplorerMode::NewFolder { name } => Some(("New folder name:", name.as_str())),
+            ExplorerMode::Rename { name } => Some(("New name:", name.as_str())),
+            ExplorerMode::Browse => None,
+        };
+        if let Some((label, value)) = dlg {
+            let dlg_w = 320usize;
+            let dlg_h = 120usize;
+            let dlg_x = x + (ww.saturating_sub(dlg_w)) / 2;
+            let dlg_y = y + (wh.saturating_sub(dlg_h)) / 2;
+
+            w.fill_round_rect(dlg_x + 3, dlg_y + 3, dlg_w, dlg_h, 10, Color { r: 8, g: 10, b: 14 });
+            w.fill_round_rect(dlg_x, dlg_y, dlg_w, dlg_h, 10, SURFACE_DARK_2);
+            w.draw_text_at(dlg_x + 16, dlg_y + 16, label, TEXT_LIGHT, SURFACE_DARK_2);
+
+            let field_x = dlg_x + 16;
+            let field_y = dlg_y + 46;
+            let field_w = dlg_w - 32;
+            widgets::text_field_modern(w, field_x, field_y, field_w, FIELD_H, value, true);
+
+            w.draw_text_at(
+                dlg_x + 16,
+                dlg_y + dlg_h - 24,
+                "Enter - OK, Esc - Cancel",
+                MUTED,
+                SURFACE_DARK_2,
+            );
+        }
     }
 
     fn draw_todo(
@@ -720,10 +1321,7 @@ impl Wm {
         let add_btn_x = field_x + field_w + 8;
 
         widgets::text_field_modern(w, field_x, field_y, field_w, FIELD_H, input, true);
-        widgets::button_modern(
-            w, add_btn_x, field_y, 72, FIELD_H,
-            "Add", ACCENT, Color::WHITE, false,
-        );
+        widgets::button_modern(w, add_btn_x, field_y, 72, FIELD_H, "Add", ACCENT, Color::WHITE, false);
 
         let list_x = x + pad;
         let list_y = field_y + FIELD_H + 12;
@@ -733,7 +1331,11 @@ impl Wm {
 
         let remove_btn_y = list_y + list_h + 10;
         widgets::button_modern(
-            w, list_x, remove_btn_y, 120, BUTTON_H,
+            w,
+            list_x,
+            remove_btn_y,
+            120,
+            BUTTON_H,
             "Remove",
             Color { r: 180, g: 60, b: 60 },
             Color::WHITE,
@@ -744,8 +1346,10 @@ impl Wm {
     fn draw_calc(&self, w: &mut Writer, win: &Window, display: &str) {
         let layout = calc_layout(win);
         let (dx, dy, dw, dh) = (
-            layout.display_x, layout.display_y,
-            layout.display_w, layout.display_h,
+            layout.display_x,
+            layout.display_y,
+            layout.display_w,
+            layout.display_h,
         );
         let (bx, by, step) = (layout.grid_x, layout.grid_y, layout.step);
 
@@ -847,11 +1451,7 @@ impl Wm {
             let label = &win.title;
             let bw = Writer::text_width(label) + 24;
             let pressed = idx == self.active && !win.minimized;
-            let bg = if pressed {
-                ACCENT
-            } else {
-                Color { r: 45, g: 48, b: 56 }
-            };
+            let bg = if pressed { ACCENT } else { Color { r: 45, g: 48, b: 56 } };
             widgets::button_modern(
                 w, bx, y + 6, bw, TASKBAR_H.saturating_sub(12),
                 label, bg, Color::WHITE, false,
@@ -887,7 +1487,7 @@ impl Wm {
         w.draw_text_at(menu_x + 16, menu_y + 14, "Rust OS", TEXT_LIGHT, SURFACE_DARK_2);
         w.draw_text_at(
             menu_x + 16, menu_y + 14 + FONT_HEIGHT,
-            "v0.5", MUTED, SURFACE_DARK_2,
+            "v0.7", MUTED, SURFACE_DARK_2,
         );
 
         let items = ["Programs", "Documents", "Settings", "Help", "Shutdown"];
@@ -952,13 +1552,3 @@ const CURSOR: &[(i32, i32, u8)] = &[
     (6,17,0),
     (6,18,1),
 ];
-
-fn draw_cursor(w: &mut Writer, mx: i32, my: i32) {
-    for &(dx, dy, c) in CURSOR {
-        let x = mx + dx;
-        let y = my + dy;
-        if x < 0 || y < 0 { continue; }
-        let color = if c == 0 { Color::DARK } else { Color::WHITE };
-        w.set_pixel(x as usize, y as usize, color);
-    }
-}

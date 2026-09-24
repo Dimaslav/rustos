@@ -22,7 +22,13 @@ pub static TICKS: AtomicU64 = AtomicU64::new(0);
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
 pub fn ticks() -> u64 { TICKS.load(Ordering::Relaxed) }
-pub fn uptime_secs() -> u64 { ticks() * 100 / 1822 }
+
+/// PIT тикает ≈18.2065 Гц → примерно 18 полных тиков в секунду.
+pub const TIMER_HZ: u64 = 18;
+
+pub fn uptime_secs() -> u64 {
+    ticks() / TIMER_HZ
+}
 
 fn read_status() -> u8 {
     unsafe { Port::<u8>::new(0x64).read() }
@@ -50,6 +56,17 @@ pub fn init() {
         let mut slave_mask: Port<u8> = Port::new(0xA1);
         master_mask.write(0b1111_1000); // IRQ0, IRQ1, IRQ2 (cascade)
         slave_mask.write(0b1110_1111);  // IRQ12
+
+        let m = Port::<u8>::new(0x21).read();
+        let s = Port::<u8>::new(0xA1).read();
+        serial_println!("[pic] master mask = {:#010b}, slave mask = {:#010b}", m, s);
+        if m & 0b100 != 0 {
+            serial_println!("[pic] !!! IRQ2 (cascade) замаскирован !!!");
+        }
+        if s & 0b0001_0000 != 0 {
+            serial_println!("[pic] !!! IRQ12 (mouse) замаскирован !!!");
+        }
+
         crate::mouse::init();
     }
 
@@ -101,33 +118,39 @@ extern "x86-interrupt" fn timer_handler(_sf: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn keyboard_handler(_sf: InterruptStackFrame) {
-    // Проверяем AUX bit (5) — если байт от мыши, отдаём mouse-подсистеме.
-    let status = read_status();
-    if status & 0x01 == 0 {
-        unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET + 1); }
-        return;
-    }
-    let b = read_data();
-    if status & 0x20 != 0 {
-        crate::mouse::push_byte(b);
-    } else {
-        crate::keyboard::handle(b);
+    // i8042 output buffer общий для IRQ1 и IRQ12 — вычитываем всё,
+    // что успело накопиться. Иначе пакет мыши может «застрять» до следующего IRQ.
+    for _ in 0..32 {
+        let status = read_status();
+        if status & 0x01 == 0 {
+            break;
+        }
+        let b = read_data();
+        if status & 0x20 != 0 {
+            crate::mouse::push_byte_irq(b);
+        } else {
+            crate::keyboard::handle(b);
+        }
     }
     unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET + 1); }
 }
 
 extern "x86-interrupt" fn mouse_handler(_sf: InterruptStackFrame) {
-    let status = read_status();
-    if status & 0x01 == 0 {
-        unsafe { PICS.lock().notify_end_of_interrupt(MOUSE_IRQ); }
-        return;
-    }
-    let b = read_data();
-    if status & 0x20 != 0 {
-        crate::mouse::push_byte(b);
-    } else {
-        // Иногда IRQ12 может прийти с клавиатурным байтом — не теряем.
-        crate::keyboard::handle(b);
+    crate::mouse::IRQ_STARTS.fetch_add(1, Ordering::Relaxed);
+
+    // Вычитываем до 32 байт: одна IRQ может принести несколько байт,
+    // а также могут быть байты от клавиатуры, которые тоже надо забрать.
+    for _ in 0..32 {
+        let status = read_status();
+        if status & 0x01 == 0 {
+            break;
+        }
+        let b = read_data();
+        if status & 0x20 != 0 {
+            crate::mouse::push_byte_irq(b);
+        } else {
+            crate::keyboard::handle(b);
+        }
     }
     unsafe { PICS.lock().notify_end_of_interrupt(MOUSE_IRQ); }
 }

@@ -8,6 +8,9 @@ use spin::Mutex;
 pub const FONT_WIDTH: usize = 9;
 pub const FONT_HEIGHT: usize = 16;
 
+pub const CURSOR_W: i32 = 12;
+pub const CURSOR_H: i32 = 19;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
@@ -42,6 +45,7 @@ fn blend(fg: Color, bg: Color, alpha: u8) -> Color {
 
 pub struct Writer {
     back: Vec<u8>,
+    scene: Vec<u8>,
     screen: &'static mut [u8],
     pub width: usize,
     pub height: usize,
@@ -52,6 +56,7 @@ pub struct Writer {
     pub cursor_y: usize,
     pub fg: Color,
     pub bg: Color,
+    last_cursor: Option<(i32, i32)>,
 }
 
 impl Writer {
@@ -63,9 +68,10 @@ impl Writer {
         bpp: usize,
         format: PixelFormat,
     ) -> Self {
-        let back_len = stride * height * bpp;
+        let buf_len = stride * height * bpp;
         Self {
-            back: vec![0u8; back_len],
+            back: vec![0u8; buf_len],
+            scene: vec![0u8; buf_len],
             screen,
             width,
             height,
@@ -76,13 +82,81 @@ impl Writer {
             cursor_y: 0,
             fg: Color::TEXT,
             bg: Color::FACE,
+            last_cursor: None,
         }
     }
 
-    pub fn flush(&mut self) {
+    // ---------- Ввод/вывод ----------
+
+    pub fn flush_all(&mut self) {
         let len = self.screen.len().min(self.back.len());
         self.screen[..len].copy_from_slice(&self.back[..len]);
     }
+
+    pub fn flush_rect(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        if w <= 0 || h <= 0 { return; }
+        let x0 = x.max(0) as usize;
+        let y0 = y.max(0) as usize;
+        let x1 = ((x + w).min(self.width as i32)).max(0) as usize;
+        let y1 = ((y + h).min(self.height as i32)).max(0) as usize;
+        if x0 >= x1 || y0 >= y1 { return; }
+        for yy in y0..y1 {
+            let off = yy * self.stride * self.bpp + x0 * self.bpp;
+            let len = (x1 - x0) * self.bpp;
+            self.screen[off..off + len].copy_from_slice(&self.back[off..off + len]);
+        }
+    }
+
+    fn copy_rect_from_scene(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        let x0 = x.max(0) as usize;
+        let y0 = y.max(0) as usize;
+        let x1 = ((x + w).min(self.width as i32)).max(0) as usize;
+        let y1 = ((y + h).min(self.height as i32)).max(0) as usize;
+        if x0 >= x1 || y0 >= y1 { return; }
+        for yy in y0..y1 {
+            let off = yy * self.stride * self.bpp + x0 * self.bpp;
+            let len = (x1 - x0) * self.bpp;
+            self.back[off..off + len].copy_from_slice(&self.scene[off..off + len]);
+        }
+    }
+
+    // ---------- Курсор ----------
+
+    /// Снять «чистую» сцену (без курсора) в отдельный буфер.
+    pub fn end_scene(&mut self) {
+        self.scene.copy_from_slice(&self.back);
+        self.last_cursor = None;
+    }
+
+    /// Восстановить старый курсор, нарисовать новый, вернуть 2 прямоугольника
+    /// (старый и новый) для flush'а.
+    pub fn move_cursor(
+        &mut self,
+        mx: i32,
+        my: i32,
+        pixels: &[(i32, i32, u8)],
+    ) -> ((i32, i32, i32, i32), (i32, i32, i32, i32)) {
+        let old_rect = if let Some((ox, oy)) = self.last_cursor {
+            self.copy_rect_from_scene(ox, oy, CURSOR_W, CURSOR_H);
+            (ox - 1, oy - 1, CURSOR_W + 2, CURSOR_H + 2)
+        } else {
+            (0, 0, 0, 0)
+        };
+
+        for &(dx, dy, c) in pixels {
+            let x = mx + dx;
+            let y = my + dy;
+            if x < 0 || y < 0 { continue; }
+            let color = if c == 0 { Color::DARK } else { Color::WHITE };
+            self.set_pixel(x as usize, y as usize, color);
+        }
+        self.last_cursor = Some((mx, my));
+
+        let new_rect = (mx - 1, my - 1, CURSOR_W + 2, CURSOR_H + 2);
+        (old_rect, new_rect)
+    }
+
+    // ---------- Базовые примитивы ----------
 
     pub fn clear(&mut self) {
         self.fill_rect(0, 0, self.width, self.height, self.bg);
@@ -102,9 +176,7 @@ impl Writer {
     }
 
     pub fn set_pixel(&mut self, x: usize, y: usize, color: Color) {
-        if x >= self.width || y >= self.height {
-            return;
-        }
+        if x >= self.width || y >= self.height { return; }
         let offset = y * self.stride * self.bpp + x * self.bpp;
         match self.format {
             PixelFormat::Rgb => {
@@ -135,7 +207,6 @@ impl Writer {
         }
     }
 
-    /// Рамка. Underflow-safe.
     pub fn draw_border(
         &mut self,
         x: usize, y: usize, w: usize, h: usize,
@@ -143,13 +214,12 @@ impl Writer {
     ) {
         if w == 0 || h == 0 || thickness == 0 { return; }
         let t = thickness.min(w).min(h);
-        self.fill_rect(x, y, w, t, color);                     // top
-        self.fill_rect(x, y + h - t, w, t, color);             // bottom
-        self.fill_rect(x, y, t, h, color);                     // left
-        self.fill_rect(x + w - t, y, t, h, color);             // right
+        self.fill_rect(x, y, w, t, color);
+        self.fill_rect(x, y + h - t, w, t, color);
+        self.fill_rect(x, y, t, h, color);
+        self.fill_rect(x + w - t, y, t, h, color);
     }
 
-    /// Win95-фаска. Underflow-safe.
     pub fn bevel(&mut self, x: usize, y: usize, w: usize, h: usize, raised: bool) {
         if w < 2 || h < 2 { return; }
         let (tl, br) = if raised {
@@ -172,8 +242,11 @@ impl Writer {
         }
     }
 
-    /// Вертикальный градиент.
-    pub fn gradient_v(&mut self, x: usize, y: usize, w: usize, h: usize, top: Color, bottom: Color) {
+    pub fn gradient_v(
+        &mut self,
+        x: usize, y: usize, w: usize, h: usize,
+        top: Color, bottom: Color,
+    ) {
         if h == 0 { return; }
         let n = (h - 1) as u32;
         for i in 0..h {
@@ -192,7 +265,6 @@ impl Writer {
         }
     }
 
-    /// Скруглённый прямоугольник.
     pub fn fill_round_rect(
         &mut self, x: usize, y: usize, w: usize, h: usize,
         radius: usize, color: Color,
@@ -221,7 +293,6 @@ impl Writer {
         }
     }
 
-    /// Текст в произвольной позиции. Не-ASCII символы рисуются как '?'.
     pub fn draw_text_at(&mut self, x: usize, y: usize, s: &str, fg: Color, bg: Color) {
         let sx = self.cursor_x;
         let sy = self.cursor_y;
@@ -306,17 +377,9 @@ pub fn with_writer<R, F: FnOnce(&mut Writer) -> R>(f: F) -> R {
     f(w)
 }
 
-pub fn flush() {
-    with_writer(|w| w.flush());
-}
-
-pub fn clear() {
-    with_writer(|w| w.clear());
-}
-
-pub fn backspace() {
-    with_writer(|w| w.backspace());
-}
+pub fn clear() { with_writer(|w| w.clear()); }
+pub fn backspace() { with_writer(|w| w.backspace()); }
+pub fn flush() { with_writer(|w| w.flush_all()); }
 
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
