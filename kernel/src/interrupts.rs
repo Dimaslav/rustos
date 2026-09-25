@@ -1,5 +1,5 @@
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use pic8259::ChainedPics;
 use spin::{Mutex, Once};
@@ -8,6 +8,7 @@ use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{
     InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode,
 };
+use x86_64::{PrivilegeLevel, VirtAddr};
 
 use crate::{println, serial_println};
 
@@ -21,13 +22,24 @@ pub static PICS: Mutex<ChainedPics> =
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
-pub fn ticks() -> u64 { TICKS.load(Ordering::Relaxed) }
+static CLOCK_DIRTY: AtomicBool = AtomicBool::new(false);
 
-/// PIT тикает ≈18.2065 Гц → примерно 18 полных тиков в секунду.
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
 pub const TIMER_HZ: u64 = 18;
 
 pub fn uptime_secs() -> u64 {
     ticks() / TIMER_HZ
+}
+
+pub fn clock_tick() {
+    CLOCK_DIRTY.store(true, Ordering::Release);
+}
+
+pub fn take_clock_dirty() -> bool {
+    CLOCK_DIRTY.swap(false, Ordering::AcqRel)
 }
 
 fn read_status() -> u8 {
@@ -41,12 +53,25 @@ fn read_data() -> u8 {
 pub fn init() {
     let mut idt = InterruptDescriptorTable::new();
     idt.breakpoint.set_handler_fn(breakpoint_handler);
-    idt.double_fault.set_handler_fn(double_fault_handler);
+    unsafe {
+        idt.double_fault
+            .set_handler_fn(double_fault_handler)
+            .set_stack_index(crate::gdt::DOUBLE_FAULT_IST_INDEX);
+    }
     idt.page_fault.set_handler_fn(page_fault_handler);
     idt.general_protection_fault.set_handler_fn(gpf_handler);
     idt[PIC_1_OFFSET].set_handler_fn(timer_handler);
     idt[PIC_1_OFFSET + 1].set_handler_fn(keyboard_handler);
     idt[MOUSE_IRQ].set_handler_fn(mouse_handler);
+
+    // int 0x80 — syscall. Доступен из Ring 3.
+    unsafe {
+        idt[0x80]
+            .set_handler_addr(VirtAddr::new(
+                crate::syscall::syscall_entry as *const () as u64,
+            ))
+            .set_privilege_level(PrivilegeLevel::Ring3);
+    }
 
     IDT.call_once(|| idt).load();
 
@@ -59,7 +84,10 @@ pub fn init() {
 
         let m = Port::<u8>::new(0x21).read();
         let s = Port::<u8>::new(0xA1).read();
-        serial_println!("[pic] master mask = {:#010b}, slave mask = {:#010b}", m, s);
+        serial_println!(
+            "[pic] master mask = {:#010b}, slave mask = {:#010b}",
+            m, s
+        );
         if m & 0b100 != 0 {
             serial_println!("[pic] !!! IRQ2 (cascade) замаскирован !!!");
         }
@@ -79,14 +107,22 @@ extern "x86-interrupt" fn breakpoint_handler(sf: InterruptStackFrame) {
     println!("EXCEPTION: BREAKPOINT");
 }
 
-extern "x86-interrupt" fn double_fault_handler(sf: InterruptStackFrame, _e: u64) -> ! {
+extern "x86-interrupt" fn double_fault_handler(
+    sf: InterruptStackFrame,
+    _error_code: u64,
+) -> ! {
     serial_println!("EXCEPTION: DOUBLE FAULT");
     serial_println!("{:#?}", sf);
     println!("EXCEPTION: DOUBLE FAULT");
-    loop { unsafe { asm!("hlt"); } }
+    loop {
+        unsafe { asm!("hlt"); }
+    }
 }
 
-extern "x86-interrupt" fn page_fault_handler(sf: InterruptStackFrame, error_code: PageFaultErrorCode) {
+extern "x86-interrupt" fn page_fault_handler(
+    sf: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
     let addr = Cr2::read();
     let protection = error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
     let write = error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
@@ -101,25 +137,43 @@ extern "x86-interrupt" fn page_fault_handler(sf: InterruptStackFrame, error_code
     serial_println!("  instr:      {}", instr);
     serial_println!("{:#?}", sf);
 
-    println!("EXCEPTION: PAGE FAULT addr={:?} w={} p={}", addr, write, protection);
-    loop { unsafe { asm!("hlt"); } }
+    println!(
+        "EXCEPTION: PAGE FAULT addr={:?} w={} p={}",
+        addr, write, protection
+    );
+    loop {
+        unsafe { asm!("hlt"); }
+    }
 }
 
-extern "x86-interrupt" fn gpf_handler(sf: InterruptStackFrame, error_code: u64) {
+extern "x86-interrupt" fn gpf_handler(
+    sf: InterruptStackFrame,
+    error_code: u64,
+) {
     serial_println!("EXCEPTION: GENERAL PROTECTION FAULT (code={})", error_code);
     serial_println!("{:#?}", sf);
-    println!("EXCEPTION: GENERAL PROTECTION FAULT (code={})", error_code);
-    loop { unsafe { asm!("hlt"); } }
+    println!(
+        "EXCEPTION: GENERAL PROTECTION FAULT (code={})",
+        error_code
+    );
+    loop {
+        unsafe { asm!("hlt"); }
+    }
 }
 
 extern "x86-interrupt" fn timer_handler(_sf: InterruptStackFrame) {
     TICKS.fetch_add(1, Ordering::Relaxed);
-    unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET); }
+    crate::task::sleep::wake_expired();
+
+    // EOI до context switch: PIC не должен ждать, пока мы вернёмся.
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET);
+    }
+
+    crate::sched::schedule_tick();
 }
 
 extern "x86-interrupt" fn keyboard_handler(_sf: InterruptStackFrame) {
-    // i8042 output buffer общий для IRQ1 и IRQ12 — вычитываем всё,
-    // что успело накопиться. Иначе пакет мыши может «застрять» до следующего IRQ.
     for _ in 0..32 {
         let status = read_status();
         if status & 0x01 == 0 {
@@ -132,14 +186,14 @@ extern "x86-interrupt" fn keyboard_handler(_sf: InterruptStackFrame) {
             crate::keyboard::handle(b);
         }
     }
-    unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET + 1); }
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET + 1);
+    }
 }
 
 extern "x86-interrupt" fn mouse_handler(_sf: InterruptStackFrame) {
     crate::mouse::IRQ_STARTS.fetch_add(1, Ordering::Relaxed);
 
-    // Вычитываем до 32 байт: одна IRQ может принести несколько байт,
-    // а также могут быть байты от клавиатуры, которые тоже надо забрать.
     for _ in 0..32 {
         let status = read_status();
         if status & 0x01 == 0 {
@@ -152,5 +206,7 @@ extern "x86-interrupt" fn mouse_handler(_sf: InterruptStackFrame) {
             crate::keyboard::handle(b);
         }
     }
-    unsafe { PICS.lock().notify_end_of_interrupt(MOUSE_IRQ); }
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(MOUSE_IRQ);
+    }
 }

@@ -12,3 +12,9 @@ linked_list_allocator = "0.10"
 noto-sans-mono-bitmap = "0.3"
 
 [workspace]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

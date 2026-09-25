@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use spin::Mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,7 +27,7 @@ impl RingBuffer {
         Self { buf: [None; RING], head: 0, tail: 0, len: 0 }
     }
     fn push(&mut self, k: Key) {
-        if self.len == RING { return; } // переполнение — теряем событие
+        if self.len == RING { return; }
         self.buf[self.tail] = Some(k);
         self.tail = (self.tail + 1) % RING;
         self.len += 1;
@@ -44,8 +45,33 @@ static MODS: Mutex<(bool, bool, bool)> = Mutex::new((false, false, false));
 static EXTENDED: Mutex<bool> = Mutex::new(false);
 static KEYS: Mutex<RingBuffer> = Mutex::new(RingBuffer::new());
 
+/// Клавиша, которая сейчас удерживается (для автоповтора).
+/// Хранится вместе с tick'ом, когда началось удержание.
+static HELD: Mutex<Option<(Key, u64)>> = Mutex::new(None);
+
 pub fn modifiers() -> (bool, bool, bool) { *MODS.lock() }
 pub fn pop() -> Option<Key> { KEYS.lock().pop() }
+
+/// Текущая удерживаемая клавиша и tick начала удержания.
+pub fn held() -> Option<(Key, u64)> {
+    *HELD.lock()
+}
+
+/// Принудительно положить клавишу в очередь (для autorepeat).
+pub fn push_key(k: Key) {
+    KEYS.lock().push(k);
+}
+
+/// Очистить состояние удержания (при release).
+fn clear_held() {
+    *HELD.lock() = None;
+}
+
+/// Установить удерживаемую клавишу.
+fn set_held(k: Key) {
+    let now = crate::interrupts::ticks();
+    *HELD.lock() = Some((k, now));
+}
 
 pub fn scancode_to_ascii(sc: u8, shift: bool) -> Option<u8> {
     let c = match sc {
@@ -122,7 +148,10 @@ pub fn handle(sc: u8) {
         _ => {}
     }
 
-    if release { return; }
+    if release {
+        clear_held();
+        return;
+    }
 
     let key = match code {
         0x01 => Some(Key::Escape),
@@ -145,11 +174,23 @@ pub fn handle(sc: u8) {
     };
     if let Some(k) = key {
         KEYS.lock().push(k);
+        // Запоминаем для автоповтора (кроме Escape и F-клавиш — их не повторяем).
+        if !matches!(k, Key::Escape | Key::F(_)) {
+            set_held(k);
+        } else {
+            clear_held();
+        }
         return;
     }
 
     let shift = MODS.lock().0;
     if let Some(c) = scancode_to_ascii(code, shift) {
-        KEYS.lock().push(Key::Char(c));
+        let k = Key::Char(c);
+        KEYS.lock().push(k);
+        set_held(k);
     }
 }
+
+/// Служебное: убирает неиспользуемый импорт если включим сборку без autorepeat.
+#[allow(dead_code)]
+fn _use_vec() { let _: Vec<u8> = Vec::new(); }

@@ -1,0 +1,27 @@
+[package]
+name = "user"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "userlib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "user"
+path = "src/main.rs"
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
+
+[[bin]]
+name = "calculator"
+path = "src/bin/calculator.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[workspace]

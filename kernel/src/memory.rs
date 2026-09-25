@@ -1,58 +1,186 @@
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
+use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Mutex;
 use x86_64::{
+    registers::control::Cr3,
     structures::paging::{
-        FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB,
+        FrameAllocator, FrameDeallocator, OffsetPageTable, PageTable, PageTableFlags,
+        PhysFrame, Size4KiB,
     },
     PhysAddr, VirtAddr,
 };
 
-/// Первый мегабайт физической памяти трогать нельзя — там IVT, BDA, VGA и т.д.
 const LOW_MEM_LIMIT: u64 = 0x10_0000;
 
-/// Инициализирует новый `OffsetPageTable`.
-///
-/// # Безопасность
-/// Вызывающий должен гарантировать, что `physical_memory_offset` корректен
-/// и вся физическая память отображена на этот виртуальный адрес.
+pub const USER_PML4_INDEX: usize = 0;
+
+pub static FRAME_ALLOCATOR: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
+pub static KERNEL_PML4_PHYS: AtomicU64 = AtomicU64::new(0);
+pub static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
+
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+    PHYS_OFFSET.store(physical_memory_offset.as_u64(), Ordering::Release);
+    let (frame, _flags) = Cr3::read();
+    KERNEL_PML4_PHYS.store(frame.start_address().as_u64(), Ordering::Release);
     let level_4_table = active_level_4_table(physical_memory_offset);
     OffsetPageTable::new(level_4_table, physical_memory_offset)
 }
 
 unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
-    use x86_64::registers::control::Cr3;
-
     let (level_4_table_frame, _) = Cr3::read();
     let phys = level_4_table_frame.start_address();
     let virt = physical_memory_offset + phys.as_u64();
     let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
-
     &mut *page_table_ptr
 }
 
-/// Аллокатор физических фреймов с O(1) выделением.
+/// Замапить фрейм в **текущее** адресное пространство (по CR3).
+///
+/// # Safety
+/// Вызывать с активным AS, куда нужно замапить. `virt` не должен быть уже замаплен.
+pub unsafe fn map_current_as(
+    phys_offset: VirtAddr,
+    virt: u64,
+    frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+    alloc: &mut impl FrameAllocator<Size4KiB>,
+) -> bool {
+    use x86_64::structures::paging::{Mapper, Page};
+    let l4 = active_level_4_table(phys_offset);
+    let mut mapper = OffsetPageTable::new(l4, phys_offset);
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    match mapper.map_to(page, frame, flags, alloc) {
+        Ok(flush) => {
+            flush.flush();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+pub struct AddressSpace {
+    pub pml4_frame: PhysFrame<Size4KiB>,
+}
+
+impl AddressSpace {
+    pub unsafe fn new_user(
+        phys_offset: VirtAddr,
+        alloc: &mut impl FrameAllocator<Size4KiB>,
+    ) -> Option<Self> {
+        let frame = alloc.allocate_frame()?;
+        let new_virt = phys_offset + frame.start_address().as_u64();
+        let new_pml4 = new_virt.as_mut_ptr::<u64>();
+        core::ptr::write_bytes(new_pml4 as *mut u8, 0, 4096);
+
+        let kernel_phys = KERNEL_PML4_PHYS.load(Ordering::Acquire);
+        if kernel_phys == 0 {
+            return None;
+        }
+        let kernel_virt = phys_offset + kernel_phys;
+        let kernel_pml4 = kernel_virt.as_ptr::<u64>();
+
+        for i in 0..512 {
+            if i == USER_PML4_INDEX {
+                continue;
+            }
+            *new_pml4.add(i) = *kernel_pml4.add(i);
+        }
+        Some(Self { pml4_frame: frame })
+    }
+
+    pub unsafe fn mapper(&self, phys_offset: VirtAddr) -> OffsetPageTable<'static> {
+        let virt = phys_offset + self.pml4_frame.start_address().as_u64();
+        let pml4_ptr: *mut PageTable = virt.as_mut_ptr();
+        OffsetPageTable::new(&mut *pml4_ptr, phys_offset)
+    }
+
+    pub unsafe fn destroy(pml4_phys: u64) {
+        let phys_offset = PHYS_OFFSET.load(Ordering::Acquire);
+        if phys_offset == 0 {
+            return;
+        }
+        let mut alloc_guard = FRAME_ALLOCATOR.lock();
+        let alloc = match alloc_guard.as_mut() {
+            Some(a) => a,
+            None => return,
+        };
+        let pml4_virt = phys_offset + pml4_phys;
+        let pml4 = pml4_virt as *const u64;
+        let entry0 = *pml4.add(USER_PML4_INDEX);
+        if entry0 & 1 == 0 {
+            dealloc_frame(alloc, pml4_phys);
+            return;
+        }
+        let pdpt_phys = entry0 & 0x000F_FFFF_FFFF_F000;
+        free_pdpt(alloc, phys_offset, pdpt_phys);
+        dealloc_frame(alloc, pml4_phys);
+    }
+}
+
+unsafe fn free_pdpt(alloc: &mut BootInfoFrameAllocator, phys_offset: u64, pdpt_phys: u64) {
+    let pdpt = (phys_offset + pdpt_phys) as *const u64;
+    for i in 0..512 {
+        let e = *pdpt.add(i);
+        if e & 1 == 0 { continue; }
+        let pd_phys = e & 0x000F_FFFF_FFFF_F000;
+        free_pd(alloc, phys_offset, pd_phys);
+    }
+    dealloc_frame(alloc, pdpt_phys);
+}
+
+unsafe fn free_pd(alloc: &mut BootInfoFrameAllocator, phys_offset: u64, pd_phys: u64) {
+    let pd = (phys_offset + pd_phys) as *const u64;
+    for i in 0..512 {
+        let e = *pd.add(i);
+        if e & 1 == 0 { continue; }
+        if e & (1 << 7) != 0 {
+            let page_phys = e & 0x000F_FFFF_FFE0_0000;
+            dealloc_frame(alloc, page_phys);
+            continue;
+        }
+        let pt_phys = e & 0x000F_FFFF_FFFF_F000;
+        free_pt(alloc, phys_offset, pt_phys);
+    }
+    dealloc_frame(alloc, pd_phys);
+}
+
+unsafe fn free_pt(alloc: &mut BootInfoFrameAllocator, phys_offset: u64, pt_phys: u64) {
+    let pt = (phys_offset + pt_phys) as *const u64;
+    for i in 0..512 {
+        let e = *pt.add(i);
+        if e & 1 == 0 { continue; }
+        let page_phys = e & 0x000F_FFFF_FFFF_F000;
+        dealloc_frame(alloc, page_phys);
+    }
+    dealloc_frame(alloc, pt_phys);
+}
+
+unsafe fn dealloc_frame(alloc: &mut BootInfoFrameAllocator, phys: u64) {
+    let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys));
+    unsafe {
+        FrameDeallocator::deallocate_frame(alloc, frame);
+    }
+}
+
 pub struct BootInfoFrameAllocator {
     memory_regions: &'static MemoryRegions,
     next_region: usize,
     next_addr: u64,
+    freed: alloc::vec::Vec<PhysFrame<Size4KiB>>,
 }
 
 impl BootInfoFrameAllocator {
-    /// Создаёт аллокатор из карты памяти загрузчика.
-    ///
-    /// # Безопасность
-    /// Фреймы, помеченные как `Usable`, действительно не должны использоваться.
     pub unsafe fn init(memory_regions: &'static MemoryRegions) -> Self {
         let mut a = Self {
             memory_regions,
             next_region: 0,
             next_addr: 0,
+            freed: alloc::vec::Vec::new(),
         };
         a.skip_to_next_usable();
         crate::serial_println!(
             "[mem] allocator init: next_region = {}, next_addr = {:#x}",
-            a.next_region,
-            a.next_addr
+            a.next_region, a.next_addr
         );
         a
     }
@@ -61,17 +189,12 @@ impl BootInfoFrameAllocator {
         self.memory_regions.iter().count()
     }
 
-    /// Ищем следующий usable-регион, начиная с `next_region`, и ставим
-    /// `next_addr` на его начало (не ниже LOW_MEM_LIMIT), выровненное на 4096.
     fn skip_to_next_usable(&mut self) {
         let count = self.region_count();
         while self.next_region < count {
             let r = match self.memory_regions.iter().nth(self.next_region) {
                 Some(r) => r,
-                None => {
-                    self.next_region = count;
-                    return;
-                }
+                None => { self.next_region = count; return; }
             };
             if r.kind == MemoryRegionKind::Usable {
                 let start = r.start.max(LOW_MEM_LIMIT);
@@ -88,20 +211,27 @@ impl BootInfoFrameAllocator {
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        if let Some(f) = self.freed.pop() {
+            return Some(f);
+        }
         loop {
             if self.next_region >= self.region_count() {
                 return None;
             }
             let r = self.memory_regions.iter().nth(self.next_region)?;
-            // Если следующий фрейм умещается в текущем регионе — отдаём его.
             if self.next_addr + 4096 <= r.end {
                 let addr = self.next_addr;
                 self.next_addr += 4096;
                 return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
             }
-            // Иначе — следующий регион.
             self.next_region += 1;
             self.skip_to_next_usable();
         }
+    }
+}
+
+impl FrameDeallocator<Size4KiB> for BootInfoFrameAllocator {
+    unsafe fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
+        self.freed.push(frame);
     }
 }

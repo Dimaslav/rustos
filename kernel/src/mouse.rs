@@ -13,6 +13,9 @@ pub enum MouseButton {
 pub enum MouseEvent {
     ButtonDown(MouseButton),
     ButtonUp(MouseButton),
+    /// Колесо: положительное — вверх, отрицательное — вниз.
+    /// Обычно диапазон [-8..7] за один «щелчок», но драйвер не ограничивает.
+    Wheel(i32),
 }
 
 const EV_CAP: usize = 32;
@@ -79,9 +82,11 @@ pub fn push_byte_irq(byte: u8) {
 }
 
 fn handle_byte(byte: u8) {
-    let (b, prev) = {
+    let (b, prev, has_wheel) = {
         let mut pkt = PACKET.lock();
+        let pkt_size = if pkt.wheel_enabled { 4 } else { 3 };
 
+        // Первый байт пакета всегда имеет bit 3 = 1.
         if pkt.idx == 0 && (byte & 0x08) == 0 {
             return;
         }
@@ -90,15 +95,16 @@ fn handle_byte(byte: u8) {
         pkt.bytes[idx] = byte;
         pkt.idx += 1;
 
-        if pkt.idx < 3 {
+        if pkt.idx < pkt_size {
             return;
         }
         pkt.idx = 0;
-        (pkt.bytes, pkt.prev_btn)
+        (pkt.bytes, pkt.prev_btn, pkt.wheel_enabled)
     };
 
     PACKETS_DONE.fetch_add(1, Ordering::Relaxed);
 
+    // Overflow в X/Y — пакет битый, пропускаем.
     if b[0] & 0xC0 != 0 {
         return;
     }
@@ -106,6 +112,15 @@ fn handle_byte(byte: u8) {
     let dx = if b[0] & 0x10 != 0 { b[1] as i32 - 256 } else { b[1] as i32 };
     let dy = if b[0] & 0x20 != 0 { b[2] as i32 - 256 } else { b[2] as i32 };
     let btn_bits = b[0] & 0x03;
+
+    let wheel = if has_wheel {
+        // Z-ось: младшие 4 бита, знаковое (2's complement).
+        // Диапазон -8..7. Иногда мыши шлют больше — тогда два пакета.
+        let raw = (b[3] & 0x0F) as i32;
+        if raw & 0x08 != 0 { raw - 16 } else { raw }
+    } else {
+        0
+    };
 
     {
         let (sw, sh) = *SCREEN.lock();
@@ -127,18 +142,27 @@ fn handle_byte(byte: u8) {
     if (btn_bits & 0x02) == 0 && (prev & 0x02) != 0 {
         q.push(MouseEvent::ButtonUp(MouseButton::Right));
     }
+    if wheel != 0 {
+        q.push(MouseEvent::Wheel(wheel));
+    }
     drop(q);
 
     PACKET.lock().prev_btn = btn_bits;
 }
 
 struct Packet {
-    bytes: [u8; 3],
+    bytes: [u8; 4],       // было [u8; 3] — теперь с запасом под Z
     idx: usize,
     prev_btn: u8,
+    wheel_enabled: bool,
 }
 
-static PACKET: Mutex<Packet> = Mutex::new(Packet { bytes: [0; 3], idx: 0, prev_btn: 0 });
+static PACKET: Mutex<Packet> = Mutex::new(Packet {
+    bytes: [0; 4],
+    idx: 0,
+    prev_btn: 0,
+    wheel_enabled: false,
+});
 
 // ---------- Инициализация i8042 ----------
 
@@ -215,10 +239,26 @@ pub unsafe fn init() {
 
     // 6. Set defaults
     mouse_write(0xF6);
-    let a1 = mouse_read();
-    crate::serial_println!("[mouse] F6 ack = {:#x} (ожидаем 0xFA)", a1);
+    let _ = mouse_read();
 
-    // 7. Enable data reporting
+    // 7. IntelliMouse magic: 200, 100, 80 → включает колесо (если поддерживается).
+    //    На обычной мыши это no-op, но ID останется 0x00.
+    for &val in &[200u8, 100u8, 80u8] {
+        mouse_write(0xF3); let _ = mouse_read();
+        mouse_write(val);  let _ = mouse_read();
+    }
+
+    // 8. Query Device ID
+    mouse_write(0xF2); let _ = mouse_read();     // ack
+    let id = mouse_read();
+    let has_wheel = id == 0x03 || id == 0x04;
+    PACKET.lock().wheel_enabled = has_wheel;
+    crate::serial_println!(
+        "[mouse] device id = {:#x}, wheel = {}",
+        id, has_wheel
+    );
+
+    // 9. Enable data reporting
     mouse_write(0xF4);
     let a2 = mouse_read();
     crate::serial_println!("[mouse] F4 ack = {:#x} (ожидаем 0xFA)", a2);

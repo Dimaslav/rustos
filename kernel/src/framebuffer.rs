@@ -5,6 +5,8 @@ use core::fmt;
 use noto_sans_mono_bitmap::{get_raster, FontWeight, RasterHeight};
 use spin::Mutex;
 
+use crate::cyrillic_font;
+
 pub const FONT_WIDTH: usize = 9;
 pub const FONT_HEIGHT: usize = 16;
 
@@ -86,8 +88,6 @@ impl Writer {
         }
     }
 
-    // ---------- Ввод/вывод ----------
-
     pub fn flush_all(&mut self) {
         let len = self.screen.len().min(self.back.len());
         self.screen[..len].copy_from_slice(&self.back[..len]);
@@ -120,16 +120,11 @@ impl Writer {
         }
     }
 
-    // ---------- Курсор ----------
-
-    /// Снять «чистую» сцену (без курсора) в отдельный буфер.
     pub fn end_scene(&mut self) {
         self.scene.copy_from_slice(&self.back);
         self.last_cursor = None;
     }
 
-    /// Восстановить старый курсор, нарисовать новый, вернуть 2 прямоугольника
-    /// (старый и новый) для flush'а.
     pub fn move_cursor(
         &mut self,
         mx: i32,
@@ -155,8 +150,6 @@ impl Writer {
         let new_rect = (mx - 1, my - 1, CURSOR_W + 2, CURSOR_H + 2);
         (old_rect, new_rect)
     }
-
-    // ---------- Базовые примитивы ----------
 
     pub fn clear(&mut self) {
         self.fill_rect(0, 0, self.width, self.height, self.bg);
@@ -329,20 +322,61 @@ impl Writer {
     }
 
     fn draw_char_colored(&mut self, c: char, fg: Color, bg: Color) {
-        let bitmap = get_raster(c, FontWeight::Regular, RasterHeight::Size16)
-            .or_else(|| get_raster('?', FontWeight::Regular, RasterHeight::Size16));
-        let bitmap = match bitmap { Some(b) => b, None => return };
+        // 1. Noto (антиалиасинг, ASCII).
+        if let Some(bitmap) = get_raster(c, FontWeight::Regular, RasterHeight::Size16) {
+            let w = bitmap.width();
+            let h = bitmap.height();
+            let raster = bitmap.raster();
+            for y in 0..h {
+                let row = raster[y];
+                for x in 0..w {
+                    let alpha = row[x];
+                    if alpha == 0 { continue; }
+                    let color = blend(fg, bg, alpha);
+                    self.set_pixel(self.cursor_x + x, self.cursor_y + y, color);
+                }
+            }
+            return;
+        }
 
-        let w = bitmap.width();
-        let h = bitmap.height();
-        let raster = bitmap.raster();
-        for y in 0..h {
-            let row = raster[y];
-            for x in 0..w {
-                let alpha = row[x];
-                if alpha == 0 { continue; }
-                let color = blend(fg, bg, alpha);
-                self.set_pixel(self.cursor_x + x, self.cursor_y + y, color);
+        // 2. Кириллица (8×8 → 9×16).
+        if let Some(bitmap) = cyrillic_font::get_cyrillic(c) {
+            self.draw_8x8(bitmap, fg, bg);
+            return;
+        }
+
+        // 3. Fallback: '?'.
+        if let Some(bitmap) = get_raster('?', FontWeight::Regular, RasterHeight::Size16) {
+            let w = bitmap.width();
+            let h = bitmap.height();
+            let raster = bitmap.raster();
+            for y in 0..h {
+                let row = raster[y];
+                for x in 0..w {
+                    let alpha = row[x];
+                    if alpha == 0 { continue; }
+                    let color = blend(fg, bg, alpha);
+                    self.set_pixel(self.cursor_x + x, self.cursor_y + y, color);
+                }
+            }
+        }
+    }
+
+    /// Рисует 8×8 битмап (bit 7 = leftmost), растянутый до 9×16.
+    fn draw_8x8(&mut self, bitmap: [u8; 8], fg: Color, bg: Color) {
+        for (row, byte) in bitmap.iter().enumerate() {
+            for col in 0..8usize {
+                let on = (byte >> (7 - col)) & 1 == 1;
+                let color = if on { fg } else { bg };
+                let x0 = self.cursor_x + col;
+                let y0 = self.cursor_y + row * 2;
+                let y1 = y0 + 1;
+                self.set_pixel(x0, y0, color);
+                self.set_pixel(x0, y1, color);
+                if col == 7 {
+                    self.set_pixel(self.cursor_x + 8, y0, color);
+                    self.set_pixel(self.cursor_x + 8, y1, color);
+                }
             }
         }
     }

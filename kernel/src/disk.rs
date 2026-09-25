@@ -7,6 +7,7 @@ pub const SECTOR_SIZE: usize = 512;
 
 pub struct AtaDrive {
     io_base: u16,
+    #[allow(dead_code)] // для будущего soft-reset через control port
     ctrl_base: u16,
     slave: bool,
 }
