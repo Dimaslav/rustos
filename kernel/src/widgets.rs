@@ -81,6 +81,10 @@ pub fn list_box_modern(
     }
 }
 
+/// Иконка + подпись на рабочем столе.
+///
+/// При `selected` — цветная подложка + белый текст.
+/// Иначе — текст с чёрной обводкой, чтобы читался на любом фоне.
 pub fn desktop_icon_modern(
     w: &mut Writer,
     x: usize, y: usize,
@@ -94,17 +98,17 @@ pub fn desktop_icon_modern(
     let icon_x = x + (size - icon_size) / 2;
     let icon_y = y + (size - icon_size) / 2;
     icons::draw(icon_kind, w, icon_x, icon_y, icon_size, Color::WHITE);
+
     let tw = Writer::text_width(label);
     let tx = x + (size.saturating_sub(tw)) / 2;
     let ty = y + size + 6;
+
     if selected {
         let bg = p.accent;
         w.fill_round_rect(tx.saturating_sub(4), ty.saturating_sub(2), tw + 8, FONT_HEIGHT + 4, 4, bg);
         w.draw_text_at(tx, ty, label, Color::WHITE, bg);
     } else {
-        let bg = p.shadow;
-        w.fill_round_rect(tx.saturating_sub(4), ty.saturating_sub(2), tw + 8, FONT_HEIGHT + 4, 4, bg);
-        w.draw_text_at(tx, ty, label, p.text, bg);
+        w.draw_text_outlined(tx, ty, label, Color::WHITE, Color::BLACK);
     }
 }
 
@@ -237,16 +241,11 @@ pub fn tooltip(w: &mut Writer, x: usize, y: usize, text: &str) {
 }
 
 /// Spinner без тригонометрии: 12 фиксированных позиций по кругу.
-///
-/// Таблица единичных векторов для 12 позиций (x, y) в диапазоне [-1, 1].
-/// Для радиуса R: px = cx + (R * table_x / 256), py = cy + (R * table_y / 256).
 pub fn spinner(w: &mut Writer, cx: usize, cy: usize, radius: usize, phase: u8) {
     const N: usize = 12;
-    // x-компоненты, домноженные на 256.
     const TABLE_X: [i32; N] = [
         256, 222, 128, 0, -128, -222, -256, -222, -128, 0, 128, 222,
     ];
-    // y-компоненты, домноженные на 256.
     const TABLE_Y: [i32; N] = [
         0, 128, 222, 256, 222, 128, 0, -128, -222, -256, -222, -128,
     ];

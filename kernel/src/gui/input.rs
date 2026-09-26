@@ -27,6 +27,23 @@ impl Wm {
         self.hover = (x, y);
         self.tooltip = None;
 
+        // --- G4: drag-n-drop файлов ---
+        if let Some(df) = &mut self.drag_files {
+            df.cur_x = x;
+            df.cur_y = y;
+            if !df.active {
+                let dx = (x - df.start_x).abs();
+                let dy = (y - df.start_y).abs();
+                if dx.max(dy) > DND_THRESHOLD {
+                    df.active = true;
+                }
+            }
+            if df.active {
+                self.dirty = true;
+                return;
+            }
+        }
+
         // --- Resize в процессе ---
         if let Some(rd) = &self.resize_drag {
             let idx = rd.idx;
@@ -112,7 +129,6 @@ impl Wm {
             self.dirty = true;
         }
 
-        // Tooltip над иконками рабочего стола.
         if self.drag.is_none() {
             let icons_arr = Self::icons();
             for (i, (_, label, _, _)) in icons_arr.iter().enumerate() {
@@ -124,7 +140,6 @@ impl Wm {
             }
         }
 
-        // Обновить курсор.
         self.resize_dir = self.detect_resize_dir(x, y);
         let new_kind = if self.drag.is_some() || self.painting.is_some() {
             self.cursor_kind
@@ -335,24 +350,29 @@ impl Wm {
                             "Выключение" => crate::power::shutdown(),
                             _ => {}
                         }
-                        self.start_pressed = false;
+                        self.close_start_menu_anim();
                         self.dirty = true;
                         return;
                     }
                 }
-                self.start_pressed = false;
+                self.close_start_menu_anim();
                 self.dirty = true;
                 return;
             }
-            self.start_pressed = false;
+            self.close_start_menu_anim();
             self.dirty = true;
         }
 
         if (y as usize) >= taskbar_y {
-            if x < 78 { self.start_pressed = !self.start_pressed; return; }
-            let mut bx = 86;
+            if x < 78 {
+                self.toggle_start_menu();
+                return;
+            }
+            let mut bx = 92;
             for idx in 0..self.windows.len() {
-                let bw = crate::framebuffer::Writer::text_width(&self.windows[idx].title) + 24;
+                let kind = Self::app_kind_of(&self.windows[idx]);
+                let _ = kind;
+                let bw = crate::framebuffer::Writer::text_width(&self.windows[idx].title) + 24 + 22;
                 if (x as usize) >= bx && (x as usize) < bx + bw {
                     if idx == self.active && !self.windows[idx].minimized {
                         self.minimize_window(idx);
@@ -363,11 +383,11 @@ impl Wm {
                     }
                     return;
                 }
-                bx += bw + 4;
+                bx += bw + 6;
             }
             return;
         }
-        self.start_pressed = false;
+        self.close_start_menu_anim();
 
         let icons = Self::icons();
         for (i, (kind, _, _, _)) in icons.iter().enumerate() {
@@ -394,7 +414,7 @@ impl Wm {
             }
         }
 
-        // Resize: если курсор над краем активного окна — начинаем ресайз.
+        // Resize.
         if let Some((idx, dir)) = self.detect_resize_dir(x, y) {
             let w = &self.windows[idx];
             self.resize_drag = Some(ResizeDrag {
@@ -450,6 +470,30 @@ impl Wm {
                 }
             } else {
                 self.handle_content_click(x, y);
+
+                // G4: если попали в список файлов Explorer — подготовить drag-n-drop.
+                if let App::Explorer { path, selected, .. } = &self.windows[self.active].content {
+                    if !selected.is_empty() {
+                        let entries = self.list_dir_entries(path);
+                        let mut items: Vec<DragFileItem> = Vec::new();
+                        for &i in selected {
+                            if let Some((name, is_dir, _)) = entries.get(i) {
+                                items.push(DragFileItem { name: name.clone(), is_dir: *is_dir });
+                            }
+                        }
+                        if !items.is_empty() {
+                            self.drag_files = Some(DragFiles {
+                                from_path: path.clone(),
+                                items,
+                                start_x: x,
+                                start_y: y,
+                                cur_x: x,
+                                cur_y: y,
+                                active: false,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -465,6 +509,19 @@ impl Wm {
             self.dirty = true;
             return;
         }
+
+        // G4: drop, если drag активен.
+        if let Some(df) = &self.drag_files {
+            if df.active {
+                self.perform_drop(x, y);
+                self.dirty = true;
+                return;
+            } else {
+                // Был лишь клик без движения — очищаем pending.
+                self.drag_files = None;
+            }
+        }
+
         if self.drag.is_some() {
             if let Some(zone) = self.snap_zone.take() {
                 let (sw, sh) = mouse::screen_size();
@@ -932,7 +989,11 @@ impl Wm {
             if let App::Notepad { mode, .. } = &mut self.windows[idx].content {
                 if !matches!(mode, NotepadMode::Browse) { *mode = NotepadMode::Browse; self.dirty = true; return; }
             }
-            self.start_pressed = false;
+            // G5: закрыть стартовое меню с анимацией, если открыто.
+            if self.start_pressed {
+                self.close_start_menu_anim();
+                return;
+            }
             self.dirty = true;
             return;
         }
@@ -1246,7 +1307,6 @@ impl Wm {
                 }
             }
             App::Todo { items, checked, selected, input } => {
-                // Специальные клавиши до Char(c), иначе они недостижимы.
                 match k {
                     Key::Enter => {
                         let s = input.trim();

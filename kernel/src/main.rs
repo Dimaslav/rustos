@@ -27,6 +27,7 @@ pub mod mouse;
 pub mod pipe;
 pub mod png;
 pub mod power;
+pub mod rtc;
 pub mod sched;
 pub mod serial;
 pub mod sound;
@@ -48,6 +49,8 @@ use x86_64::VirtAddr;
 #[allow(deprecated)]
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
+    // Требуем минимум Full HD. Если QEMU не даст 1920x1080, bootloader
+    // паникует — тогда в src/main.rs надо уменьшить xres/yres.
     config.frame_buffer.minimum_framebuffer_width = Some(1920);
     config.frame_buffer.minimum_framebuffer_height = Some(1080);
     config.mappings.physical_memory = Some(Mapping::Dynamic);
@@ -56,7 +59,6 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
-/// Аварийный вывод в COM1 — работает даже до `serial::init`.
 unsafe fn emergency(s: &str) {
     use x86_64::instructions::port::Port;
     let mut data: Port<u8> = Port::new(0x3F8);
@@ -113,14 +115,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let buffer = fb.buffer_mut();
     framebuffer::init(info, buffer);
     log_info!(
-        "[boot] 8. framebuffer {}x{} ({} bpp)",
-        info.width, info.height, info.bytes_per_pixel * 8
+        "[boot] 8. framebuffer {}x{} ({} bpp), stride={}",
+        info.width, info.height, info.bytes_per_pixel * 8, info.stride
     );
 
     unsafe { crate::gdt::init(); }
     log_info!("[boot] 8.5 GDT/TSS ready");
 
-    // ---- FAT32 ----
     let fat32 = {
         use crate::disk::{AtaDrive, parse_mbr, is_fat32_type};
         let mut drive = AtaDrive::new(0x1F0, 0x3F6, false);
@@ -157,7 +158,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::task::spawn(crate::task::clock::clock_task());
     crate::task::spawn(crate::task::repeat::repeat_task());
 
-    // ---------- HEADLESS TEST MODE ----------
     #[cfg(feature = "headless_test")]
     {
         crate::sched::sleep_ms(50);
@@ -171,7 +171,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         crate::power::shutdown();
     }
 
-    // ---------- NORMAL GUI PATH ----------
     #[cfg(not(feature = "headless_test"))]
     {
         crate::sched::spawn("demo", demo_thread);

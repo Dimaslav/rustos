@@ -287,6 +287,14 @@ fn map_user_region(
     Ok(())
 }
 
+/// Кладёт args на user-стек. Возвращает (RSP, argv_ptr, argc).
+///
+/// System V AMD64 ABI: при входе в функцию RSP % 16 == 8 (как будто только
+/// что сделан `call`). Компилятор user-кода использует `movaps [rsp - N]`
+/// для SSE, и если RSP не выровнен — ловим #GP → #DF → RIP=0.
+///
+/// Поэтому после раскладки argv делаем `sp &= !15` (теперь 16-выровнен),
+/// затем `sp -= 8` (становится ≡ 8 mod 16).
 unsafe fn setup_user_stack(stack_top: u64, args: &[String]) -> (u64, u64, u64) {
     let mut sp = stack_top;
     let mut str_ptrs: Vec<u64> = Vec::new();
@@ -302,6 +310,7 @@ unsafe fn setup_user_stack(stack_top: u64, args: &[String]) -> (u64, u64, u64) {
     }
     str_ptrs.reverse();
 
+    // NULL-терминатор argv.
     sp -= 8;
     *(sp as *mut u64) = 0;
     for p in str_ptrs.iter().rev() {
@@ -310,14 +319,31 @@ unsafe fn setup_user_stack(stack_top: u64, args: &[String]) -> (u64, u64, u64) {
     }
     let argv_ptr = sp;
 
+    // argc — на случай, если user-код смотрит на [rsp] в старом стиле.
     sp -= 8;
     *(sp as *mut u64) = args.len() as u64;
+
+    // Выравнивание стека по System V ABI: RSP % 16 == 8 на входе в _start.
     sp &= !15;
+    sp -= 8;
 
     (sp, argv_ptr, args.len() as u64)
 }
 
 /// Переход Ring 0 → Ring 3 с argv (rdi=argc, rsi=argv).
+///
+/// Использует явные регистры (rax, rcx, rdx, rsi, rdi, r8, r9), потому что
+/// порядок push'ей для iretq критичен. Именованные аргументы asm! не подходят
+/// — мы не можем позволить компилятору перераспределить регистры.
+///
+/// Порядок push'ей (снизу вверх по стеку):
+///   push rax  → SS
+///   push rcx  → RSP
+///   push rdx  → RFLAGS
+///   push rsi  → CS
+///   push rdi  → RIP
+/// Затем iretq снимает их в обратном порядке: RIP, CS, RFLAGS, RSP, SS.
+/// После iretq rdi/rsi задают argc/argv для точки входа user-кода.
 ///
 /// # Safety
 /// Валидные селекторы, entry, stack_top; CR3 = user-AS.

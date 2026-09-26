@@ -170,7 +170,6 @@ impl Writer {
         }
     }
 
-    /// Возвращает цвет пикселя по координатам, или None если вне экрана.
     #[inline]
     pub fn get_pixel(&self, x: usize, y: usize) -> Option<Color> {
         if x >= self.width || y >= self.height { return None; }
@@ -217,7 +216,6 @@ impl Writer {
         }
     }
 
-    /// Alpha-наложение: blend существующего пикселя с `color` через `alpha` (0..255).
     pub fn blend_pixel(&mut self, x: usize, y: usize, color: Color, alpha: u8) {
         if x >= self.width || y >= self.height || alpha == 0 { return; }
         if alpha == 255 { self.set_pixel(x, y, color); return; }
@@ -257,21 +255,13 @@ impl Writer {
         }
     }
 
-    /// Заливает прямоугольник цветом с alpha-смешением.
     pub fn fill_rect_blend(
         &mut self,
-        x: usize,
-        y: usize,
-        w: usize,
-        h: usize,
-        color: Color,
-        alpha: u8,
+        x: usize, y: usize, w: usize, h: usize,
+        color: Color, alpha: u8,
     ) {
         if alpha == 0 { return; }
-        if alpha == 255 {
-            self.fill_rect(x, y, w, h, color);
-            return;
-        }
+        if alpha == 255 { self.fill_rect(x, y, w, h, color); return; }
         let x1 = (x + w).min(self.width);
         let y1 = (y + h).min(self.height);
         let a = alpha as u32;
@@ -304,10 +294,6 @@ impl Writer {
         }
     }
 
-    /// Box blur по региону `(x, y, w, h)` радиусом `radius`.
-    ///
-    /// Реализация: два прохода (горизонтальный и вертикальный) — O(w·h·r),
-    /// но с малым `r` (2–8) это быстрее прямого O(w·h·r²).
     pub fn blur_rect(&mut self, x: usize, y: usize, w: usize, h: usize, radius: usize) {
         if radius == 0 || w == 0 || h == 0 { return; }
         if self.bpp < 3 { return; }
@@ -318,11 +304,9 @@ impl Writer {
         let rh = y1 - y;
         let r = radius;
 
-        // Временные буферы: RGB 3 байта на пиксель.
         let mut tmp = vec![0u8; rw * rh * 3];
         let mut out = vec![0u8; rw * rh * 3];
 
-        // Забираем исходные пиксели.
         for yy in 0..rh {
             for xx in 0..rw {
                 let src_off = (y + yy) * self.stride * self.bpp + (x + xx) * self.bpp;
@@ -346,7 +330,6 @@ impl Writer {
             }
         }
 
-        // Горизонтальный проход: tmp → out.
         for yy in 0..rh {
             for xx in 0..rw {
                 let mut sr = 0u32;
@@ -369,7 +352,6 @@ impl Writer {
             }
         }
 
-        // Вертикальный проход: out → tmp.
         for yy in 0..rh {
             for xx in 0..rw {
                 let mut sr = 0u32;
@@ -392,7 +374,6 @@ impl Writer {
             }
         }
 
-        // Возвращаем в back.
         for yy in 0..rh {
             for xx in 0..rw {
                 let src = (yy * rw + xx) * 3;
@@ -547,7 +528,6 @@ impl Writer {
         }
     }
 
-    /// Закруглённый прямоугольник с AA **и** alpha-прозрачностью.
     pub fn fill_round_rect_aa_blend(
         &mut self, x: usize, y: usize, w: usize, h: usize,
         radius: usize, color: Color, base_alpha: u8,
@@ -612,6 +592,98 @@ impl Writer {
         }
         self.cursor_x = sx;
         self.cursor_y = sy;
+    }
+
+    /// Рисует текст, **не затирая фон** под ним: только пиксели с alpha > 0.
+    /// Для кириллицы — только «горящие» пиксели 8×8.
+    /// Для ASCII — только пиксели с ненулевой alpha из растра (blend поверх).
+    pub fn draw_text_at_alpha(&mut self, x: usize, y: usize, s: &str, fg: Color) {
+        let sx = self.cursor_x;
+        let sy = self.cursor_y;
+        self.cursor_x = x;
+        self.cursor_y = y;
+        for c in s.chars() {
+            self.draw_char_alpha(c, fg);
+            self.cursor_x += FONT_WIDTH;
+        }
+        self.cursor_x = sx;
+        self.cursor_y = sy;
+    }
+
+    fn draw_char_alpha(&mut self, c: char, fg: Color) {
+        // 1. Noto (антиалиасинг, ASCII + латиница).
+        if let Some(bitmap) = get_raster(c, FontWeight::Regular, RasterHeight::Size16) {
+            let w = bitmap.width();
+            let h = bitmap.height();
+            let raster = bitmap.raster();
+            for y in 0..h {
+                let row = raster[y];
+                for x in 0..w {
+                    let alpha = row[x];
+                    if alpha == 0 { continue; }
+                    self.blend_pixel(self.cursor_x + x, self.cursor_y + y, fg, alpha);
+                }
+            }
+            return;
+        }
+
+        // 2. Кириллица — только on-пиксели.
+        if let Some(bitmap) = cyrillic_font::get_cyrillic(c) {
+            for (row, byte) in bitmap.iter().enumerate() {
+                for col in 0..8usize {
+                    let on = (byte >> (7 - col)) & 1 == 1;
+                    if !on { continue; }
+                    let x0 = self.cursor_x + col;
+                    let y0 = self.cursor_y + row * 2;
+                    self.set_pixel(x0, y0, fg);
+                    self.set_pixel(x0, y0 + 1, fg);
+                    if col == 7 {
+                        self.set_pixel(self.cursor_x + 8, y0, fg);
+                        self.set_pixel(self.cursor_x + 8, y0 + 1, fg);
+                    }
+                }
+            }
+            return;
+        }
+
+        // 3. Fallback: '?' (только альфа-пиксели).
+        if let Some(bitmap) = get_raster('?', FontWeight::Regular, RasterHeight::Size16) {
+            let w = bitmap.width();
+            let h = bitmap.height();
+            let raster = bitmap.raster();
+            for y in 0..h {
+                let row = raster[y];
+                for x in 0..w {
+                    let alpha = row[x];
+                    if alpha == 0 { continue; }
+                    self.blend_pixel(self.cursor_x + x, self.cursor_y + y, fg, alpha);
+                }
+            }
+        }
+    }
+
+    /// Текст с обводкой 1 px. Сначала рисуем контур по 8 смещениям,
+    /// потом основной текст поверх. Работает и для кириллицы, и для ASCII,
+    /// потому что и обводка, и основной текст рисуются только по «горящим»
+    /// пикселям, не затирая фон прямоугольником.
+    pub fn draw_text_outlined(
+        &mut self,
+        x: usize,
+        y: usize,
+        s: &str,
+        fg: Color,
+        outline: Color,
+    ) {
+        for &(dx, dy) in &[
+            (-1i32, -1i32), (0, -1), (1, -1),
+            (-1, 0), (1, 0),
+            (-1, 1), (0, 1), (1, 1),
+        ] {
+            let xx = (x as i32 + dx).max(0) as usize;
+            let yy = (y as i32 + dy).max(0) as usize;
+            self.draw_text_at_alpha(xx, yy, s, outline);
+        }
+        self.draw_text_at_alpha(x, y, s, fg);
     }
 
     pub fn text_width(s: &str) -> usize {

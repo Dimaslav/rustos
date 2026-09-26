@@ -26,9 +26,7 @@ fn try_make_disk() {
             eprintln!("[myos] fat32.img не найден — запускаю {} make_disk.py", py);
             let status = Command::new(py).arg("make_disk.py").status();
             if let Ok(s) = status {
-                if s.success() {
-                    return;
-                }
+                if s.success() { return; }
             }
         }
     }
@@ -49,14 +47,21 @@ fn run_interactive(bios_path: &str, disk_path: &str) {
     let qemu = which_qemu();
     let status = Command::new(qemu)
         .args([
+            "-m", "512M",
             "-drive", &format!("format=raw,file={}", bios_path),
             "-drive", &format!("format=raw,file={},if=ide,index=1,media=disk", disk_path),
             "-serial", "stdio",
             "-no-reboot",
             "-no-shutdown",
+            // VGA с расширенной памятью + EDID 1920x1080.
+            // Через -global, а не -device: QEMU 11.x корректно применяет
+            // эти свойства к дефолтному VGA, даже если создаётся -vga std.
             "-vga", "std",
-            "-global", "VGA.vgamem_mb=32",
-            "-display", "gtk",
+            "-global", "VGA.vgamem_mb=64",
+            "-global", "VGA.edid=on",
+            "-global", "VGA.xres=1920",
+            "-global", "VGA.yres=1080",
+            "-display", "gtk,zoom-to-fit=on",
         ])
         .status()
         .expect("QEMU не запустился");
@@ -73,11 +78,13 @@ fn run_headless(bios_path: &str, disk_path: &str) {
 
     let mut cmd = Command::new(qemu);
     cmd.args([
+        "-m", "512M",
         "-drive", &format!("format=raw,file={}", bios_path),
         "-serial", &format!("file:{}", log),
         "-display", "none",
         "-no-reboot",
-        // ВАЖНО: без -no-shutdown, иначе QEMU не выйдет при ACPI shutdown.
+        "-vga", "std",
+        "-global", "VGA.vgamem_mb=32",
     ]);
     if Path::new(disk_path).exists() {
         cmd.args([

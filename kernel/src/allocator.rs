@@ -8,7 +8,9 @@ use x86_64::{
 };
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 32 * 1024 * 1024; // 32 МиБ (два экранных буфера ~5.5 МиБ + запас)
+/// 64 МиБ: два framebuffer-буфера по 1920×1080×3 = ~12 МиБ + запас
+/// на анимации, GUI, VFS и user-alloc.
+pub const HEAP_SIZE: usize = 64 * 1024 * 1024;
 
 #[global_allocator]
 pub static ALLOCATOR: LockedHeap = LockedHeap::empty();

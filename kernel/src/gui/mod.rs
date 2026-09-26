@@ -21,9 +21,9 @@ use crate::interrupts::{ticks, TIMER_HZ};
 use crate::keyboard;
 use crate::mouse::{self, MouseButton, MouseEvent};
 use crate::sound;
-use state::TITLE_H;
 
 use cursors::CursorKind;
+use state::{PatternKind, TITLE_H};
 
 pub struct WallpaperBuf {
     pub width: usize,
@@ -55,12 +55,15 @@ pub struct Wm {
     pub(in crate::gui) prev_alt: bool,
 
     pub(in crate::gui) wallpaper: Option<WallpaperBuf>,
+    pub(in crate::gui) wallpaper_pattern: PatternKind,
     pub(in crate::gui) tooltip: Option<(String, i32, i32)>,
 
-    // --- G3: курсоры и ресайз ---
     pub(in crate::gui) cursor_kind: CursorKind,
     pub(in crate::gui) resize_dir: Option<(usize, state::ResizeDir)>,
     pub(in crate::gui) resize_drag: Option<state::ResizeDrag>,
+
+    pub(in crate::gui) drag_files: Option<state::DragFiles>,
+    pub(in crate::gui) menu_anim: Option<state::MenuAnim>,
 }
 
 pub fn run() -> ! {
@@ -125,6 +128,8 @@ pub fn run() -> ! {
             wm.switcher_close_and_apply();
             wm.dirty = true;
         }
+
+        wm.tick_menu_anim();
 
         let mut finalize: Option<(usize, anim::RectOnDone)> = None;
         if let Some(rc) = &wm.anim.rect_anim {
@@ -223,14 +228,58 @@ impl Wm {
             snap_zone: None,
             prev_alt: false,
             wallpaper: None,
+            wallpaper_pattern: PatternKind::Dots,
             tooltip: None,
             cursor_kind: CursorKind::Arrow,
             resize_dir: None,
             resize_drag: None,
+            drag_files: None,
+            menu_anim: None,
         };
         wm.load_wallpaper();
         wm.open_app(AppKind::Explorer);
         wm
+    }
+
+    pub(in crate::gui) fn tick_menu_anim(&mut self) {
+        if let Some(a) = &self.menu_anim {
+            let elapsed = ticks().saturating_sub(a.start_tick);
+            if elapsed >= state::MENU_ANIM_TICKS {
+                if !a.opening {
+                    self.start_pressed = false;
+                }
+                self.menu_anim = None;
+                self.dirty = true;
+            } else {
+                self.dirty = true;
+            }
+        }
+    }
+
+    pub(in crate::gui) fn toggle_start_menu(&mut self) {
+        if self.start_pressed {
+            self.menu_anim = Some(state::MenuAnim {
+                start_tick: ticks(),
+                opening: false,
+            });
+        } else {
+            self.start_pressed = true;
+            self.menu_anim = Some(state::MenuAnim {
+                start_tick: ticks(),
+                opening: true,
+            });
+        }
+        self.dirty = true;
+    }
+
+    pub(in crate::gui) fn close_start_menu_anim(&mut self) {
+        if self.start_pressed && self.menu_anim.is_none() {
+            self.menu_anim = Some(state::MenuAnim {
+                start_tick: ticks(),
+                opening: false,
+            });
+            self.dirty = true;
+        }
     }
 
     fn load_wallpaper(&mut self) {
@@ -250,7 +299,7 @@ impl Wm {
             });
             return;
         }
-        crate::log_warn!("[wallpaper] no wallpaper, using gradient");
+        crate::log_warn!("[wallpaper] no wallpaper, using gradient + pattern");
     }
 
     pub(in crate::gui) fn focus_window(&mut self, idx: usize) {
@@ -414,15 +463,16 @@ impl Wm {
             ),
         };
 
+        // Размеры окон под Full HD (1920×1080).
         let (ww, wh) = if kind == AppKind::Explorer {
-            (720, 460)
+            (1200, 760)
         } else {
-            (500, 340)
+            (760, 520)
         };
-        let off = self.windows.len() as i32 * 28;
+        let off = self.windows.len() as i32 * 40;
         self.windows.push(Window {
-            x: 100 + off,
-            y: 70 + off,
+            x: 220 + off,
+            y: 140 + off,
             w: ww,
             h: wh,
             title,
@@ -594,6 +644,65 @@ impl Wm {
         self.dirty = true;
     }
 
+    pub(in crate::gui) fn perform_drop(&mut self, x: i32, y: i32) {
+        let df = match self.drag_files.take() {
+            Some(d) => d,
+            None => return,
+        };
+        if !df.active { self.dirty = true; return; }
+
+        let mut target_path: Option<String> = None;
+        for idx in (0..self.windows.len()).rev() {
+            let w = &self.windows[idx];
+            if w.minimized { continue; }
+            if !crate::widgets::hit(x, y, w.x as usize, w.y as usize, w.w, w.h) { continue; }
+            if let App::Explorer { path, .. } = &w.content {
+                target_path = Some(path.clone());
+                break;
+            }
+        }
+        let Some(target) = target_path else {
+            self.dirty = true;
+            return;
+        };
+        if target == df.from_path {
+            self.dirty = true;
+            return;
+        }
+
+        let on_disk_src = df.from_path.starts_with("C:");
+        let on_disk_dst = target.starts_with("C:");
+
+        let mut copied = 0usize;
+        for item in &df.items {
+            if item.is_dir { continue; }
+
+            let src = fs::join(&df.from_path, &item.name);
+            let data = if on_disk_src {
+                crate::vfs::fat32_read_path(&src)
+            } else {
+                crate::vfs::ramfs_read(&src)
+            };
+            let Some(data) = data else { continue; };
+
+            let ok = if on_disk_dst {
+                let dst = fs::join(&target, &item.name);
+                crate::vfs::fat32_write_path(&dst, &data)
+            } else {
+                crate::vfs::ramfs_create_file(&target, &item.name, &data)
+            };
+            if ok { copied += 1; }
+        }
+
+        if copied > 0 {
+            let msg = alloc::format!("Скопировано: {}", copied);
+            self.anim.toast(&msg, anim::ToastKind::Success);
+        } else {
+            self.anim.toast("Не удалось скопировать", anim::ToastKind::Warn);
+        }
+        self.dirty = true;
+    }
+
     pub(in crate::gui) fn icons() -> [(AppKind, &'static str, icons::IconKind, framebuffer::Color); 5] {
         use framebuffer::Color;
         use icons::IconKind;
@@ -602,26 +711,45 @@ impl Wm {
             (AppKind::Notepad,    "Блокнот",     IconKind::Notepad,  Color { r: 100, g: 150, b: 255 }),
             (AppKind::Todo,       "Задачи",      IconKind::Todo,     Color { r: 80,  g: 200, b: 120 }),
             (AppKind::Calculator, "Калькулятор", IconKind::Calc,     Color { r: 240, g: 150, b: 60  }),
-            (AppKind::Paint,      "Paint",       IconKind::Paint,    Color { r: 220, g: 90,  b: 180 }),
+            (AppKind::Paint,      "Paint",       IconKind::Paint,    Color { r: 80,  g: 200, b: 200 }),
         ]
     }
 
+    /// Сетка 5×5 под Full HD: столбцы по 130 px, ряды по 105 px.
     pub(in crate::gui) fn icon_rect(i: usize) -> (usize, usize, usize, usize) {
         use state::{ICON_STEP, ICON_X, ICON_Y};
-        let col = i / 4;
-        let row = i % 4;
-        (ICON_X + col * ICON_STEP, ICON_Y + row * 90, 44, 66)
+        let col = i / 5;
+        let row = i % 5;
+        (ICON_X + col * ICON_STEP, ICON_Y + row * 105, 44, 66)
     }
 
-    // ---------- G3: определение cursor и resize ----------
+    pub(in crate::gui) fn app_kind_of(win: &Window) -> AppKind {
+        match &win.content {
+            App::Explorer { .. }   => AppKind::Explorer,
+            App::Notepad { .. }    => AppKind::Notepad,
+            App::Todo { .. }       => AppKind::Todo,
+            App::Calculator { .. } => AppKind::Calculator,
+            App::Paint { .. }      => AppKind::Paint,
+        }
+    }
 
-    /// Определить, над каким краем активного окна находится курсор.
+    pub(in crate::gui) fn icon_for_kind(kind: AppKind) -> (icons::IconKind, framebuffer::Color) {
+        use framebuffer::Color;
+        use icons::IconKind;
+        match kind {
+            AppKind::Explorer   => (IconKind::Folder,  Color { r: 255, g: 195, b: 70  }),
+            AppKind::Notepad    => (IconKind::Notepad, Color { r: 100, g: 150, b: 255 }),
+            AppKind::Todo       => (IconKind::Todo,    Color { r: 80,  g: 200, b: 120 }),
+            AppKind::Calculator => (IconKind::Calc,    Color { r: 240, g: 150, b: 60  }),
+            AppKind::Paint      => (IconKind::Paint,   Color { r: 80,  g: 200, b: 200 }),
+        }
+    }
+
     pub(in crate::gui) fn detect_resize_dir(&self, x: i32, y: i32) -> Option<(usize, state::ResizeDir)> {
         let idx = self.active;
         if idx >= self.windows.len() { return None; }
         let w = &self.windows[idx];
         if w.minimized { return None; }
-        // Нельзя ресайзить во время анимации.
         if self.anim.rect_anim.is_some() { return None; }
 
         let e = state::RESIZE_EDGE;
@@ -630,7 +758,6 @@ impl Wm {
         let ww = w.w as i32;
         let wh = w.h as i32;
 
-        // Заголовок исключаем из верхнего края — там drag.
         let on_left   = x >= wx - e && x < wx + e;
         let on_right  = x >= wx + ww - e && x < wx + ww + e;
         let on_top    = y >= wy - e && y < wy + e;
@@ -655,10 +782,7 @@ impl Wm {
         Some((idx, dir))
     }
 
-    /// Определить, над каким краем **любого** окна курсор (для cursor).
-    /// Приоритет — topmost (active).
     pub(in crate::gui) fn cursor_for_pos(&self, x: i32, y: i32) -> CursorKind {
-        // Resize — только над активным окном.
         if let Some((_, dir)) = self.detect_resize_dir(x, y) {
             use state::ResizeDir::*;
             return match dir {
@@ -669,7 +793,6 @@ impl Wm {
             };
         }
 
-        // I-beam над текстовыми полями.
         if self.point_in_text_field(x, y) {
             return CursorKind::IBeam;
         }
@@ -677,19 +800,15 @@ impl Wm {
         CursorKind::Arrow
     }
 
-    /// Попадает ли точка в редактируемое текстовое поле активного окна.
     fn point_in_text_field(&self, x: i32, y: i32) -> bool {
         let idx = self.active;
         if idx >= self.windows.len() { return false; }
         let w = &self.windows[idx];
         if w.minimized { return false; }
-        let wx = w.x.max(0) as usize;
-        let wy = w.y.max(0) as usize;
         if x < w.x || y < w.y { return false; }
         let rel_x = (x - w.x) as usize;
         let rel_y = (y - w.y) as usize;
         if rel_x >= w.w || rel_y >= w.h { return false; }
-        let _ = (wx, wy);
 
         match &w.content {
             App::Notepad { .. } => {

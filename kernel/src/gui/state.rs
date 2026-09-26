@@ -4,20 +4,21 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 pub const TITLE_H: usize = 30;
-pub const TASKBAR_H: usize = 42;
+pub const TASKBAR_H: usize = 48;
 pub const CLOSE_BTN_W: usize = 26;
 pub const MIN_BTN_W: usize = 26;
 
-pub const ICON_X: usize = 32;
-pub const ICON_Y: usize = 32;
-pub const ICON_STEP: usize = 110;
+/// Сетка иконок рабочего стола — под 1920×1080.
+pub const ICON_X: usize = 60;
+pub const ICON_Y: usize = 60;
+pub const ICON_STEP: usize = 130;
 
 pub const EXP_TOOLBAR_H: usize = 38;
-pub const EXP_ROW_H: usize = 28;
-pub const EXP_SIDEBAR_W: usize = 160;
+pub const EXP_ROW_H: usize = 32;
+pub const EXP_SIDEBAR_W: usize = 180;
 
-pub const CTX_MENU_W: usize = 160;
-pub const CTX_ITEM_H: usize = 26;
+pub const CTX_MENU_W: usize = 180;
+pub const CTX_ITEM_H: usize = 28;
 
 pub const SCROLLBAR_W: usize = 10;
 
@@ -30,10 +31,11 @@ pub const START_MENU_ITEMS: [&str; 6] = [
     "Выключение",
 ];
 
-pub const START_MENU_H: usize = 272;
+pub const START_MENU_H: usize = 300;
 
-/// Толщина невидимой рамки вокруг окна, за которую можно ресайзить.
 pub const RESIZE_EDGE: i32 = 6;
+pub const MENU_ANIM_TICKS: u64 = 8;
+pub const DND_THRESHOLD: i32 = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SnapZone {
@@ -148,13 +150,11 @@ pub struct Drag {
     pub(in crate::gui) oy: i32,
 }
 
-/// Направление ресайза окна.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ResizeDir {
     N, S, E, W, NE, NW, SE, SW,
 }
 
-/// Состояние активного ресайза.
 pub struct ResizeDrag {
     pub idx: usize,
     pub dir: ResizeDir,
@@ -164,6 +164,36 @@ pub struct ResizeDrag {
     pub wy0: i32,
     pub ww0: i32,
     pub wh0: i32,
+}
+
+#[derive(Clone)]
+pub struct DragFileItem {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+pub struct DragFiles {
+    pub from_path: String,
+    pub items: Vec<DragFileItem>,
+    pub start_x: i32,
+    pub start_y: i32,
+    pub cur_x: i32,
+    pub cur_y: i32,
+    pub active: bool,
+}
+
+pub struct MenuAnim {
+    pub start_tick: u64,
+    pub opening: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PatternKind {
+    None,
+    Dots,
+    Grid,
+    Diagonal,
+    Stars,
 }
 
 pub const CURSOR: &[(i32, i32, u8)] = &[

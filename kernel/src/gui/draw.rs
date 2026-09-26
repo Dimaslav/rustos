@@ -5,7 +5,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::framebuffer::{Color, Writer, FONT_HEIGHT};
-use crate::interrupts::uptime_secs;
+use crate::rtc;
 use crate::widgets;
 
 use super::anim;
@@ -22,6 +22,9 @@ impl Wm {
             draw_wallpaper(w, wp);
         } else {
             w.gradient_v(0, 0, w.width, w.height, p.wallpaper_top, p.wallpaper_bottom);
+            if self.wallpaper_pattern != PatternKind::None {
+                draw_pattern_overlay(w, self.wallpaper_pattern);
+            }
         }
 
         let icons_arr = Self::icons();
@@ -56,7 +59,7 @@ impl Wm {
 
         self.draw_taskbar(w);
 
-        if self.start_pressed {
+        if self.start_pressed || self.menu_anim.is_some() {
             self.draw_start_menu(w);
         }
 
@@ -81,11 +84,54 @@ impl Wm {
         }
 
         self.draw_toasts(w);
+        self.draw_drag_ghost(w);
 
-        // Tooltip — поверх всего, но под курсором (курсор рисуется отдельно).
         if let Some((text, tx, ty)) = &self.tooltip {
             widgets::tooltip(w, (*tx).max(0) as usize, (*ty).max(0) as usize, text);
         }
+    }
+
+    fn draw_drag_ghost(&self, w: &mut Writer) {
+        let df = match &self.drag_files {
+            Some(d) if d.active => d,
+            _ => return,
+        };
+        let p = theme::palette();
+        let cx = df.cur_x.max(0) as usize;
+        let cy = df.cur_y.max(0) as usize;
+
+        let n = df.items.len();
+        let label: String = if n == 1 {
+            df.items[0].name.clone()
+        } else {
+            format!("{} файлов", n)
+        };
+        let is_dir_first = df.items.first().map(|i| i.is_dir).unwrap_or(false);
+
+        let icon_size = 20usize;
+        let tw = Writer::text_width(&label);
+        let pad_x = 10usize;
+        let pad_y = 6usize;
+        let ww = (icon_size + 6 + tw + pad_x * 2).min(280);
+        let wh = icon_size + pad_y * 2;
+
+        w.fill_round_rect_aa(cx + 2, cy + 3, ww, wh, 8, p.shadow);
+        w.fill_round_rect_aa(cx, cy, ww, wh, 8, p.window_bg_alt);
+
+        let (icon_kind, color) = if is_dir_first {
+            (icons::IconKind::Folder, Color { r: 255, g: 195, b: 70 })
+        } else {
+            (icons::IconKind::File, Color { r: 230, g: 235, b: 245 })
+        };
+        icons::draw(icon_kind, w, cx + pad_x, cy + pad_y, icon_size, color);
+
+        w.draw_text_at(
+            cx + pad_x + icon_size + 6,
+            cy + (wh - FONT_HEIGHT) / 2,
+            &label,
+            p.text,
+            p.window_bg_alt,
+        );
     }
 
     fn draw_switcher(&self, w: &mut Writer) {
@@ -113,22 +159,11 @@ impl Wm {
 
             w.fill_round_rect_aa(x, y, card_w, card_h, 12, bg);
 
-            let (icon_kind, icon_color) = match &win.content {
-                App::Explorer { .. }   => (icons::IconKind::Folder,  Color { r: 255, g: 195, b: 70  }),
-                App::Notepad { .. }    => (icons::IconKind::Notepad, Color { r: 100, g: 150, b: 255 }),
-                App::Todo { .. }       => (icons::IconKind::Todo,    Color { r: 80,  g: 200, b: 120 }),
-                App::Calculator { .. } => (icons::IconKind::Calc,    Color { r: 240, g: 150, b: 60  }),
-                App::Paint { .. }      => (icons::IconKind::Paint,   Color { r: 220, g: 90,  b: 180 }),
-            };
+            let kind = Self::app_kind_of(win);
+            let (icon_kind, icon_color) = Self::icon_for_kind(kind);
 
             w.fill_round_rect_aa(x + card_w / 2 - 20, y + 14, 40, 40, 10, icon_color);
-            icons::draw(
-                icon_kind, w,
-                x + card_w / 2 - 20 + 6,
-                y + 14 + 6,
-                28,
-                Color::WHITE,
-            );
+            icons::draw(icon_kind, w, x + card_w / 2 - 14, y + 20, 28, Color::WHITE);
 
             let title_w = Writer::text_width(&win.title);
             let tx = x + (card_w.saturating_sub(title_w)) / 2;
@@ -211,7 +246,16 @@ impl Wm {
         let ww = win.w;
         let wh = win.h;
 
-        w.fill_round_rect_aa(x + 4, y + 4, ww, wh, 10, p.shadow);
+        for i in (1..=4usize).rev() {
+            let alpha: u8 = match i {
+                1 => 100,
+                2 => 70,
+                3 => 45,
+                _ => 25,
+            };
+            w.fill_round_rect_aa_blend(x + i, y + i, ww, wh, 10, p.shadow, alpha);
+        }
+
         w.fill_round_rect_aa(x, y, ww, wh, 10, p.window_bg);
 
         let title_bg = if active { p.title_active } else { p.title_inactive };
@@ -224,7 +268,20 @@ impl Wm {
             w.fill_round_rect_aa(x, y, ww, TITLE_H + 10, 10, title_bg);
             w.fill_rect(x, y + TITLE_H, ww, 10, p.window_bg);
         }
-        w.draw_text_at(x + 14, y + (TITLE_H - FONT_HEIGHT) / 2, &win.title, p.text, title_bg);
+
+        let kind = Self::app_kind_of(win);
+        let (icon_kind, _icon_color) = Self::icon_for_kind(kind);
+        let icon_size = 16usize;
+        let icon_y = y + (TITLE_H - icon_size) / 2;
+        icons::draw(icon_kind, w, x + 10, icon_y, icon_size, p.text);
+
+        w.draw_text_at(
+            x + 10 + icon_size + 8,
+            y + (TITLE_H - FONT_HEIGHT) / 2,
+            &win.title,
+            p.text,
+            title_bg,
+        );
 
         let cb_x = x + ww.saturating_sub(12 + CLOSE_BTN_W);
         let cb_y = y + (TITLE_H - 20) / 2;
@@ -383,9 +440,9 @@ impl Wm {
         let ren_x = del_x + 80;
 
         widgets::button_modern(w, back_x, toolbar_y, 42, EXP_TOOLBAR_H, "", p.window_bg_alt, p.text, false);
-        draw_arrow_left(w, back_x, toolbar_y + 10, p.text);
+        draw_arrow_left(w, back_x, toolbar_y + 12, p.text);
         widgets::button_modern(w, up_x, toolbar_y, 42, EXP_TOOLBAR_H, "", p.window_bg_alt, p.text, false);
-        draw_arrow_up(w, up_x, toolbar_y + 10, p.text);
+        draw_arrow_up(w, up_x + 14, toolbar_y + 9, p.text);
 
         let nf_label = if on_disk { "Файл" } else { "Папка" };
         widgets::button_modern(w, nf_x, toolbar_y, 86, EXP_TOOLBAR_H, nf_label, p.window_bg_alt, p.text, false);
@@ -411,12 +468,23 @@ impl Wm {
 
         let sidebar_x = x + 10;
         w.fill_round_rect(sidebar_x, body_y, EXP_SIDEBAR_W, body_h, 6, p.window_bg_alt);
-        let items: [&str; 6] = ["Домой", "Рабочий стол", "Документы", "Загрузки", "Система", "Диск (C:)"];
-        for (i, name) in items.iter().enumerate() {
+
+        let sidebar_items: [(&str, SidebarIcon); 6] = [
+            ("Домой",         SidebarIcon::Home),
+            ("Рабочий стол",  SidebarIcon::Desktop),
+            ("Документы",     SidebarIcon::Documents),
+            ("Загрузки",      SidebarIcon::Downloads),
+            ("Система",       SidebarIcon::System),
+            ("Диск (C:)",     SidebarIcon::Disk),
+        ];
+        for (i, (name, kind)) in sidebar_items.iter().enumerate() {
             let ry = body_y + 14 + i * 30;
-            let active_here = (name == &"Диск (C:)" && on_disk) || (name == &"Домой" && path == "/");
+            let active_here = (matches!(kind, SidebarIcon::Disk) && on_disk)
+                || (matches!(kind, SidebarIcon::Home) && path == "/");
+            let (icon_kind, icon_color) = sidebar_icon(*kind);
+            icons::draw(icon_kind, w, sidebar_x + 12, ry + 4, 16, icon_color);
             let fg = if active_here { p.accent } else { p.text };
-            w.draw_text_at(sidebar_x + 12, ry + 5, name, fg, p.window_bg_alt);
+            w.draw_text_at(sidebar_x + 36, ry + 5, name, fg, p.window_bg_alt);
         }
 
         let view_x = x + EXP_SIDEBAR_W + 20;
@@ -451,17 +519,21 @@ impl Wm {
             if sel {
                 w.fill_round_rect(view_x + 6, ry, view_w.saturating_sub(12), EXP_ROW_H - 2, 5, bg);
             }
-            draw_file_icon(w, view_x + 12, ry + 4, *is_dir, bg);
+
+            let icon_size = 24usize;
+            let icon_y = ry + (EXP_ROW_H.saturating_sub(icon_size)) / 2;
+            draw_file_icon(w, view_x + 12, icon_y, name, *is_dir, icon_size);
+
             let fg = if sel { Color::WHITE } else { p.text };
-            w.draw_text_at(view_x + 48, ry + 5, name, fg, bg);
+            let text_y = ry + (EXP_ROW_H - FONT_HEIGHT) / 2;
+            w.draw_text_at(view_x + 12 + icon_size + 12, text_y, name, fg, bg);
             if !*is_dir {
                 let sz = format!("{} Б", size);
                 let sz_fg = if sel { Color::WHITE } else { p.text_muted };
-                w.draw_text_at(view_x + view_w.saturating_sub(120), ry + 5, &sz, sz_fg, bg);
+                w.draw_text_at(view_x + view_w.saturating_sub(120), text_y, &sz, sz_fg, bg);
             }
         }
 
-        // Новый scrollbar_v из widgets.
         if max_scroll > 0 {
             let sb_x = view_x + view_w - SCROLLBAR_W - 2;
             let sb_y = view_y + 34;
@@ -543,7 +615,6 @@ impl Wm {
             if is_sel {
                 w.fill_round_rect(list_x + 4, iy, list_w - 8, row_h - 2, 4, p.accent);
             }
-            // Checkbox 18x18 слева.
             let cb_x = list_x + 12;
             let cb_y = iy + (row_h - 18) / 2;
             let cb_size = 18usize;
@@ -567,7 +638,6 @@ impl Wm {
                     w.set_pixel(cx - 1 + k, cy - k + 4, p.accent);
                 }
             }
-            // Текст. Если отмечено — серым.
             let (fg, bg) = if is_sel {
                 (Color::WHITE, p.accent)
             } else if is_chk {
@@ -633,56 +703,194 @@ impl Wm {
         if p.blur_radius > 0 {
             w.blur_rect(0, y, w.width, TASKBAR_H, p.blur_radius);
         }
-
         w.fill_rect_blend(0, y, w.width, TASKBAR_H, p.taskbar_bg, p.taskbar_alpha);
         w.fill_rect(0, y, w.width, 1, p.border);
 
-        let start_hover = widgets::hit(self.hover.0, self.hover.1, 6, y + 6, 70, TASKBAR_H.saturating_sub(12));
-        let start_bg = if self.start_pressed || start_hover { p.accent } else { p.window_bg_alt };
-        widgets::button_modern(w, 6, y + 6, 70, TASKBAR_H.saturating_sub(12), "Пуск", start_bg, Color::WHITE, false);
+        let btn_h = TASKBAR_H.saturating_sub(14);
+        let btn_y = y + (TASKBAR_H - btn_h) / 2;
+        let start_hover = widgets::hit(self.hover.0, self.hover.1, 6, btn_y, 70, btn_h);
+        let start_active = self.start_pressed || self.menu_anim.is_some();
+        let start_bg = if start_active || start_hover { p.accent } else { p.window_bg_alt };
+        widgets::button_modern(w, 6, btn_y, 70, btn_h, "Пуск", start_bg, Color::WHITE, false);
 
-        let mut bx = 86;
+        w.fill_rect(82, y + 12, 1, TASKBAR_H.saturating_sub(24), p.border);
+
+        let mut bx = 96usize;
         for (idx, win) in self.windows.iter().enumerate() {
+            let kind = Self::app_kind_of(win);
+            let (icon_kind, icon_color) = Self::icon_for_kind(kind);
+
             let label = &win.title;
-            let bw = Writer::text_width(label) + 24;
+            let label_w = Writer::text_width(label);
+            let bw = 14 + 16 + 8 + label_w + 14;
             let pressed = idx == self.active && !win.minimized;
-            let bg = if pressed { p.accent } else { p.window_bg_alt };
-            widgets::button_modern(w, bx, y + 6, bw, TASKBAR_H.saturating_sub(12), label, bg, Color::WHITE, false);
-            bx += bw + 4;
+            let hover = widgets::hit(self.hover.0, self.hover.1, bx, btn_y, bw, btn_h);
+            let bg = if pressed {
+                p.accent
+            } else if hover {
+                p.accent_hover
+            } else {
+                p.window_bg_alt
+            };
+
+            w.fill_round_rect(bx + 1, btn_y + 1, bw, btn_h, 6, p.shadow);
+            w.fill_round_rect(bx, btn_y, bw, btn_h, 6, bg);
+
+            let icon_size = 16usize;
+            let icon_y = btn_y + (btn_h.saturating_sub(icon_size)) / 2;
+            icons::draw(icon_kind, w, bx + 14, icon_y, icon_size, icon_color);
+
+            let text_y = btn_y + (btn_h.saturating_sub(FONT_HEIGHT)) / 2;
+            w.draw_text_at(bx + 14 + 16 + 8, text_y, label, Color::WHITE, bg);
+
+            if pressed {
+                let pw = bw.min(40);
+                let px = bx + (bw - pw) / 2;
+                w.fill_round_rect(px, y + TASKBAR_H - 3, pw, 3, 1, p.accent_hover);
+            }
+
+            bx += bw + 10;
         }
 
-        let secs = uptime_secs();
-        let text = format!("{:02}:{:02}", (secs / 60) % 60, secs % 60);
-        let tw = Writer::text_width(&text);
-        w.draw_text_at(w.width.saturating_sub(tw + 16), y + (TASKBAR_H - FONT_HEIGHT) / 2, &text, p.text, p.taskbar_bg);
+        let now = rtc::read_rtc();
+        let time_str = format!("{:02}:{:02}", now.hour, now.minute);
+        let date_str = format!("{:02}.{:02}.20{:02}", now.day, now.month, now.year);
+        let tw = Writer::text_width(&time_str);
+        let dw = Writer::text_width(&date_str);
+        let max_w = tw.max(dw);
+        let right_block_x = w.width.saturating_sub(max_w + 20);
+        let center_x = right_block_x + max_w / 2;
+
+        let tx_time = center_x.saturating_sub(tw / 2);
+        let tx_date = center_x.saturating_sub(dw / 2);
+        let line1_y = y + (TASKBAR_H - (FONT_HEIGHT * 2 + 2)) / 2;
+        let line2_y = line1_y + FONT_HEIGHT + 2;
+        w.draw_text_at(tx_time, line1_y, &time_str, p.text, p.taskbar_bg);
+        w.draw_text_at(tx_date, line2_y, &date_str, p.text_muted, p.taskbar_bg);
     }
 
     fn draw_start_menu(&self, w: &mut Writer) {
         let p = theme::palette();
         let h = w.height;
         let menu_h = START_MENU_H;
-        let menu_w = 240;
-        let menu_x = 6;
-        let menu_y = h.saturating_sub(TASKBAR_H + menu_h + 6);
+        let menu_w = 240usize;
+        let base_x = 6i32;
+        let base_y = (h as i32) - (TASKBAR_H as i32) - (menu_h as i32) - 6;
 
-        if p.blur_radius > 0 {
+        let (y_off, alpha) = if let Some(a) = &self.menu_anim {
+            let elapsed = crate::interrupts::ticks().saturating_sub(a.start_tick);
+            let t = (elapsed as f32 / MENU_ANIM_TICKS as f32).min(1.0);
+            if a.opening {
+                let p1 = 1.0 - (1.0 - t) * (1.0 - t);
+                (((1.0 - p1) * menu_h as f32) as i32, (p1 * 255.0) as u8)
+            } else {
+                ((t * menu_h as f32) as i32, ((1.0 - t) * 255.0) as u8)
+            }
+        } else {
+            (0, 255)
+        };
+
+        let menu_x = base_x.max(0) as usize;
+        let menu_y = (base_y + y_off).max(0) as usize;
+        let alpha = alpha.max(20);
+
+        if p.blur_radius > 0 && alpha > 128 {
             w.blur_rect(menu_x, menu_y, menu_w, menu_h, p.blur_radius);
         }
 
         w.fill_round_rect_aa(menu_x + 4, menu_y + 4, menu_w, menu_h, 12, p.shadow);
-        w.fill_round_rect_aa_blend(menu_x, menu_y, menu_w, menu_h, 12, p.window_bg_alt, p.menu_alpha);
+        let bg_alpha = ((p.menu_alpha as u32 * alpha as u32) / 255) as u8;
+        w.fill_round_rect_aa_blend(menu_x, menu_y, menu_w, menu_h, 12, p.window_bg_alt, bg_alpha);
 
-        w.draw_text_at(menu_x + 16, menu_y + 14, "Rust OS", p.text, p.window_bg_alt);
-        w.draw_text_at(menu_x + 16, menu_y + 14 + FONT_HEIGHT, "v0.9", p.text_muted, p.window_bg_alt);
+        if alpha > 60 {
+            w.draw_text_at(menu_x + 16, menu_y + 14, "Rust OS", p.text, p.window_bg_alt);
+            w.draw_text_at(menu_x + 16, menu_y + 14 + FONT_HEIGHT, "v0.9", p.text_muted, p.window_bg_alt);
 
-        for (i, item) in START_MENU_ITEMS.iter().enumerate() {
-            let iy = menu_y + 60 + i * 32;
-            let hover = widgets::hit(self.hover.0, self.hover.1, menu_x + 8, iy, menu_w.saturating_sub(16), 28);
-            let bg = if hover { p.accent } else { p.window_bg_alt };
-            if hover {
-                w.fill_round_rect(menu_x + 8, iy, menu_w.saturating_sub(16), 28, 6, bg);
+            for (i, item) in START_MENU_ITEMS.iter().enumerate() {
+                let iy = menu_y + 60 + i * 32;
+                let hover = widgets::hit(self.hover.0, self.hover.1, menu_x + 8, iy, menu_w.saturating_sub(16), 28);
+                let bg = if hover { p.accent } else { p.window_bg_alt };
+                if hover {
+                    w.fill_round_rect(menu_x + 8, iy, menu_w.saturating_sub(16), 28, 6, bg);
+                }
+                w.draw_text_at(menu_x + 20, iy + 5, item, p.text, bg);
             }
-            w.draw_text_at(menu_x + 20, iy + 5, item, p.text, bg);
+        }
+    }
+}
+
+/// Паттерн поверх градиента обоев. Рисуется очень прозрачными точками/линиями,
+/// чтобы не отвлекать от окон.
+fn draw_pattern_overlay(w: &mut Writer, kind: PatternKind) {
+    let dot = Color { r: 255, g: 255, b: 255 };
+    match kind {
+        PatternKind::None => {}
+        PatternKind::Dots => {
+            let step = 40usize;
+            let mut y = 20usize;
+            while y < w.height {
+                let mut x = 20usize;
+                while x < w.width {
+                    w.blend_pixel(x, y, dot, 25);
+                    if x + 1 < w.width { w.blend_pixel(x + 1, y, dot, 15); }
+                    if y + 1 < w.height { w.blend_pixel(x, y + 1, dot, 15); }
+                    if x + 1 < w.width && y + 1 < w.height {
+                        w.blend_pixel(x + 1, y + 1, dot, 8);
+                    }
+                    x += step;
+                }
+                y += step;
+            }
+        }
+        PatternKind::Grid => {
+            let step = 40usize;
+            for y in (0..w.height).step_by(step) {
+                for x in 0..w.width {
+                    w.blend_pixel(x, y, dot, 12);
+                }
+            }
+            for x in (0..w.width).step_by(step) {
+                for y in 0..w.height {
+                    w.blend_pixel(x, y, dot, 12);
+                }
+            }
+        }
+        PatternKind::Diagonal => {
+            let step = 36usize;
+            let n = w.width + w.height;
+            let mut d = 0usize;
+            while d < n {
+                let start_y = if d >= w.width { d - w.width + 1 } else { 0 };
+                let end_y = d.min(w.height.saturating_sub(1));
+                let mut y = start_y;
+                while y <= end_y {
+                    let x = d - y;
+                    if x < w.width {
+                        w.blend_pixel(x, y, dot, 14);
+                    }
+                    y += 1;
+                }
+                d += step;
+            }
+        }
+        PatternKind::Stars => {
+            let step = 80usize;
+            let mut yi = 0usize;
+            let mut y = 30usize;
+            while y < w.height {
+                let x_off = if yi % 2 == 0 { 0 } else { step / 2 };
+                let mut x = x_off + 30;
+                while x < w.width {
+                    w.blend_pixel(x, y, dot, 30);
+                    if x >= 1 { w.blend_pixel(x - 1, y, dot, 20); }
+                    if x + 1 < w.width { w.blend_pixel(x + 1, y, dot, 20); }
+                    if y >= 1 { w.blend_pixel(x, y - 1, dot, 20); }
+                    if y + 1 < w.height { w.blend_pixel(x, y + 1, dot, 20); }
+                    x += step;
+                }
+                y += step;
+                yi += 1;
+            }
         }
     }
 }
@@ -695,7 +903,12 @@ fn draw_foreign(w: &mut Writer, fw: &crate::win::ForeignWindow) {
     let hh = fw.h as usize;
     let title_h = crate::win::TITLE_BAR_H as usize;
 
-    w.fill_round_rect(x + 4, y + 4, ww, hh + title_h, 10, p.shadow);
+    for i in (1..=4usize).rev() {
+        let alpha: u8 = match i {
+            1 => 100, 2 => 70, 3 => 45, _ => 25,
+        };
+        w.fill_round_rect_aa_blend(x + i, y + i, ww, hh + title_h, 10, p.shadow, alpha);
+    }
     w.fill_round_rect(x, y, ww, hh + title_h, 10, p.window_bg);
 
     let title_bg = p.title_active;
