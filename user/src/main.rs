@@ -1,15 +1,40 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use userlib::*;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     write(b"[user] alive\n");
+
+    // ---------- Тест аллокатора ----------
+    {
+        use alloc::format;
+        use alloc::string::String;
+        use alloc::vec::Vec;
+
+        let mut v: Vec<String> = Vec::new();
+        for i in 0..100u32 {
+            v.push(format!("item-{}", i));
+        }
+        let msg = format!("[user] vec len = {}\n", v.len());
+        write(msg.as_bytes());
+
+        // Проверим, что первый и последний элементы корректны.
+        if v.first().map(|s| s.as_str()) == Some("item-0")
+            && v.last().map(|s| s.as_str()) == Some("item-99")
+        {
+            write(b"[user] alloc test OK\n");
+        } else {
+            write(b"[user] alloc test FAIL\n");
+        }
+    }
+    // ---------- /Тест аллокатора ----------
+
     sleep_ms(300);
 
-    // Спавним shell в отдельном AS — он забирает клавиатуру себе
-    // (set_focus(true)) и читает serial-ввод.
     write(b"[user] spawning shell\n");
     let shell_id = exec("shell");
     if shell_id == u64::MAX {
@@ -18,7 +43,6 @@ pub extern "C" fn _start() -> ! {
         write(b"[user] shell spawned\n");
     }
 
-    // Спавним калькулятор — он создаст своё окно поверх GUI.
     sleep_ms(200);
     write(b"[user] spawning calculator\n");
     let calc_id = spawn_calc();
@@ -28,7 +52,6 @@ pub extern "C" fn _start() -> ! {
         write(b"[user] calc spawned\n");
     }
 
-    // Основной процесс просто спит в фоне.
     loop {
         sleep_ms(2000);
         write(b"[user] heartbeat\n");
@@ -36,4 +59,7 @@ pub extern "C" fn _start() -> ! {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    write(b"[user] panic!\n");
+    loop {}
+}

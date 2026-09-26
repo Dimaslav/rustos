@@ -19,6 +19,8 @@ pub enum ThreadState {
 
 pub struct Thread {
     pub id: ThreadId,
+    pub parent_id: ThreadId,
+    pub exit_code: i32,
     pub name: &'static str,
     pub rsp: u64,
     stack_ptr: usize,
@@ -35,6 +37,7 @@ impl Thread {
         name: &'static str,
         entry: extern "C" fn() -> !,
         pml4_phys: Option<u64>,
+        parent_id: ThreadId,
     ) -> Box<Thread> {
         let layout = Layout::from_size_align(STACK_SIZE, STACK_ALIGN).unwrap();
         let stack_ptr = unsafe { alloc_zeroed(layout) };
@@ -46,6 +49,8 @@ impl Thread {
 
         Box::new(Thread {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            parent_id,
+            exit_code: 0,
             name,
             rsp,
             stack_ptr: stack_ptr as usize,
@@ -59,6 +64,8 @@ impl Thread {
     pub fn main_kernel() -> Box<Thread> {
         Box::new(Thread {
             id: 0,
+            parent_id: 0,
+            exit_code: 0,
             name: "main",
             rsp: 0,
             stack_ptr: 0,
@@ -80,6 +87,8 @@ impl Thread {
 
         Box::new(Thread {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            parent_id: 0,
+            exit_code: 0,
             name: "idle",
             rsp,
             stack_ptr: stack_ptr as usize,
@@ -105,7 +114,6 @@ impl Thread {
 
 impl Drop for Thread {
     fn drop(&mut self) {
-        // Снести все foreign-окна этого потока.
         crate::win::destroy_for_pid(self.id);
 
         if self.stack_ptr != 0 {

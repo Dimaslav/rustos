@@ -507,8 +507,6 @@ impl Fat32 {
         })
     }
 
-    /// Записать массив 32-байтовых записей подряд в каталог, начиная с
-    /// `(start_lba, start_off)`. Может переходить в следующий сектор кластера.
     fn write_dir_entries(
         &mut self,
         dir_cluster: u32,
@@ -559,9 +557,6 @@ impl Fat32 {
         Ok(())
     }
 
-    /// Найти место под `n` подряд идущих 32-байтовых слотов в каталоге.
-    /// Возвращает `(lba, offset)` первого слота. `write_dir_entries` сам
-    /// справится с переходом между секторами.
     fn find_free_dir_slots(
         &mut self,
         dir_cluster: u32,
@@ -606,7 +601,6 @@ impl Fat32 {
 
             let next = self.fat_next(cluster);
             if next == cluster || next >= 0x0FFF_FFF8 {
-                // Расширяем каталог на один кластер.
                 let new_c = self.allocate_chain(1).ok_or(FatError::NoSpace)?;
                 let zeros = vec![0u8; csize];
                 self.write_cluster(new_c, &zeros);
@@ -619,8 +613,6 @@ impl Fat32 {
         Err(FatError::NoSpace)
     }
 
-    /// Сгенерировать SHORT 8.3 имя + массив LFN-записей для `name`.
-    /// Возвращает `(short_11_bytes_padded_to_32, lfn_entries_в_порядке_записи)`.
     fn build_short_and_lfn(
         &mut self,
         dir_cluster: u32,
@@ -644,8 +636,6 @@ impl Fat32 {
         Ok((short_entry, lfn_entries))
     }
 
-    /// Сгенерировать synthetic SHORT 8.3 имя для длинного имени,
-    /// избегая коллизий в каталоге.
     fn synthetic_short(
         &mut self,
         dir_cluster: u32,
@@ -705,7 +695,6 @@ impl Fat32 {
         Err(FatError::NoSpace)
     }
 
-    /// Найти запись по 11-байтовому короткому имени (без LFN).
     fn find_in_dir_short(&mut self, dir_cluster: u32, short11: &[u8; 11]) -> Option<FatEntry> {
         let raw = self.read_chain(dir_cluster, None);
         let mut i = 0usize;
@@ -835,8 +824,6 @@ impl Fat32 {
         Ok(())
     }
 
-    /// Помечает `total` записей как удалённые (0xE5), начиная с записи
-    /// `(lba, off)`, идя назад на `back` записей.
     fn mark_dir_entries_deleted(
         &mut self,
         lba: u32,
@@ -885,10 +872,6 @@ impl Fat32 {
     ///   4. записать новые записи;
     ///   5. только после успеха — пометить старые как удалённые.
     ///
-    /// Если между (4) и (5) произойдёт сбой питания, в каталоге окажутся две
-    /// записи с одинаковыми данными. Это не потеря файла — лишнюю можно
-    /// удалить вручную.
-    ///
     /// Ограничение MVP: поиск коллизий и свободных слотов идёт в корне.
     pub fn rename(&mut self, entry: &FatEntry, new_name: &str) -> FatResult<()> {
         if !valid_name(new_name) {
@@ -901,7 +884,6 @@ impl Fat32 {
             return Err(FatError::AlreadyExists);
         }
 
-        // 1. Сохраняем метаданные старой записи.
         let old_lba = entry.dir_offset;
         let old_off = entry.entry_off;
         let old_lfn_count = entry.lfn_count;
@@ -914,17 +896,14 @@ impl Fat32 {
         }
         let attr = old_sector[old_off + 11];
 
-        // 2. Строим новое имя.
         let dir_cluster = self.root_cluster;
         let (short_entry_template, lfn_entries) =
             self.build_short_and_lfn(dir_cluster, new_name)?;
         let total_new = lfn_entries.len() + 1;
 
-        // 3. Ищем свободные слоты, НЕ трогая старую запись.
         let (new_lba, new_off, _cross) =
             self.find_free_dir_slots(dir_cluster, total_new)?;
 
-        // 4. Заполняем short-entry, сохраняя attr/cluster/size.
         let mut short_entry = short_entry_template;
         short_entry[11] = attr;
         let cl_lo = (first_cluster & 0xFFFF) as u16;
@@ -945,10 +924,8 @@ impl Fat32 {
         }
         all_entries.push(short_entry);
 
-        // Пишем новые записи.
         self.write_dir_entries(dir_cluster, new_lba, new_off, &all_entries)?;
 
-        // 5. Только теперь удаляем старые.
         self.mark_dir_entries_deleted(
             old_lba,
             old_off,
@@ -1011,6 +988,173 @@ impl Fat32 {
         })
     }
 
+    // ---------- Path-based helpers ----------
+
+    /// Разобрать путь от корня, вернуть `FatEntry` последнего компонента.
+    /// Корень (`""`, `"/"`, `"C:"`) → `None` (у корня нет FatEntry).
+    ///
+    /// Поддерживает только спуск, без `..` — см. ограничение MVP.
+    pub fn resolve_path(&mut self, path: &str) -> Option<FatEntry> {
+        let cleaned = path
+            .trim_start_matches("C:")
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        if cleaned.is_empty() {
+            return None;
+        }
+        let parts: Vec<&str> = cleaned
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != ".")
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut current_cluster = self.root_cluster;
+        for (i, part) in parts.iter().enumerate() {
+            if *part == ".." {
+                return None;
+            }
+            let entry = self.find_in_dir(current_cluster, part)?;
+            if i == parts.len() - 1 {
+                return Some(entry);
+            }
+            if entry.kind != FatKind::Directory {
+                return None;
+            }
+            current_cluster = entry.first_cluster;
+        }
+        None
+    }
+
+    /// Кластер родительского каталога для `path`:
+    /// - `/foo/bar.txt` → кластер `foo`
+    /// - `bar.txt`      → root_cluster
+    /// - `""`, `"/"`    → root_cluster
+    pub fn parent_cluster_of(&mut self, path: &str) -> Option<u32> {
+        let cleaned = path
+            .trim_start_matches("C:")
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        if cleaned.is_empty() {
+            return Some(self.root_cluster);
+        }
+        let parts: Vec<&str> = cleaned
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != ".")
+            .collect();
+        if parts.len() <= 1 {
+            return Some(self.root_cluster);
+        }
+        let parent_path = parts[..parts.len() - 1].join("/");
+        let parent = self.resolve_path(&parent_path)?;
+        if parent.kind != FatKind::Directory {
+            return None;
+        }
+        Some(parent.first_cluster)
+    }
+
+    /// Листинг каталога по пути. `""`, `"/"`, `"C:"` → корень.
+    pub fn list_dir_by_path(&mut self, path: &str) -> Vec<FatEntry> {
+        let cleaned = path
+            .trim_start_matches("C:")
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        if cleaned.is_empty() {
+            return self.list_root();
+        }
+        match self.resolve_path(cleaned) {
+            Some(e) if e.kind == FatKind::Directory => self.list_dir(&e),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Прочитать файл по пути.
+    pub fn read_file_by_path(&mut self, path: &str) -> Option<Vec<u8>> {
+        let entry = self.resolve_path(path)?;
+        if entry.kind != FatKind::File {
+            return None;
+        }
+        Some(self.read_file(&entry))
+    }
+
+    /// Записать файл по пути. Если файла нет — создать в родителе.
+    pub fn write_file_by_path(&mut self, path: &str, data: &[u8]) -> bool {
+        let cleaned = path
+            .trim_start_matches("C:")
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        if cleaned.is_empty() {
+            return false;
+        }
+        let name = match cleaned.rsplit('/').next() {
+            Some(n) if !n.is_empty() => n,
+            _ => return false,
+        };
+        let parent = match self.parent_cluster_of(cleaned) {
+            Some(p) => p,
+            None => return false,
+        };
+        if let Some(mut e) = self.find_in_dir(parent, name) {
+            if e.kind != FatKind::File {
+                return false;
+            }
+            return self.write_file(&mut e, data).is_ok();
+        }
+        match self.create_file(parent, name) {
+            Ok(mut e) => {
+                let ok = self.write_file(&mut e, data).is_ok();
+                let _ = self.flush();
+                ok
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// `mkdir` по пути.
+    pub fn mkdir_by_path(&mut self, path: &str) -> bool {
+        let cleaned = path
+            .trim_start_matches("C:")
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        if cleaned.is_empty() {
+            return false;
+        }
+        let name = match cleaned.rsplit('/').next() {
+            Some(n) if !n.is_empty() => n,
+            _ => return false,
+        };
+        let parent = match self.parent_cluster_of(cleaned) {
+            Some(p) => p,
+            None => return false,
+        };
+        self.mkdir(parent, name).is_ok()
+    }
+
+    /// Удалить файл/пустой каталог по пути.
+    pub fn remove_by_path(&mut self, path: &str) -> bool {
+        let entry = match self.resolve_path(path) {
+            Some(e) => e,
+            None => return false,
+        };
+        self.remove(&entry).is_ok()
+    }
+
+    /// Переименовать по пути.
+    pub fn rename_by_path(&mut self, old: &str, new_name: &str) -> bool {
+        let entry = match self.resolve_path(old) {
+            Some(e) => e,
+            None => return false,
+        };
+        self.rename(&entry, new_name).is_ok()
+    }
+
+    /// Метаданные по пути: `(size, is_dir)`.
+    pub fn stat_by_path(&mut self, path: &str) -> Option<(u64, bool)> {
+        let entry = self.resolve_path(path)?;
+        Some((entry.size as u64, entry.kind == FatKind::Directory))
+    }
+
     // ---------- Flush ----------
 
     pub fn flush(&mut self) -> FatResult<()> {
@@ -1030,7 +1174,6 @@ fn valid_name(name: &str) -> bool {
         && name.len() <= 255
 }
 
-/// Возвращает `Some(short_11)`, если имя помещается в plain 8.3 без потерь.
 fn plain_8_3(name: &str) -> Option<[u8; 11]> {
     let (stem, ext) = match name.rfind('.') {
         Some(i) if i > 0 && i < name.len() - 1 => (&name[..i], &name[i + 1..]),
@@ -1074,7 +1217,6 @@ fn parse_short_name(raw: &[u8]) -> String {
     if ext.is_empty() { name } else { format!("{}.{}", name, ext) }
 }
 
-/// LFN checksum от 11-байтового short name.
 fn lfn_checksum(short11: &[u8; 11]) -> u8 {
     let mut sum: u8 = 0;
     for &b in short11.iter() {
@@ -1083,11 +1225,9 @@ fn lfn_checksum(short11: &[u8; 11]) -> u8 {
     sum
 }
 
-/// Собрать LFN-записи для длинного имени. Возвращает в порядке записи
-/// на диск: `[ord N | 0x40], [ord N-1], ..., [ord 1]`.
 fn make_lfn_entries(short11: &[u8; 11], long: &str) -> Vec<[u8; 32]> {
     let mut utf16: Vec<u16> = long.encode_utf16().collect();
-    utf16.push(0); // terminator
+    utf16.push(0);
 
     let mut chunks: Vec<[u16; 13]> = Vec::new();
     let mut idx = 0;
@@ -1129,7 +1269,6 @@ fn make_lfn_entries(short11: &[u8; 11], long: &str) -> Vec<[u8; 32]> {
 }
 
 fn write_dot_entries(buf: &mut [u8], self_cluster: u32, parent_cluster: u32) {
-    // "."
     let mut e = [0u8; 32];
     e[0..8].copy_from_slice(b".       ");
     e[8..11].copy_from_slice(b"   ");
@@ -1142,7 +1281,6 @@ fn write_dot_entries(buf: &mut [u8], self_cluster: u32, parent_cluster: u32) {
     e[27] = (lo >> 8) as u8;
     buf[0..32].copy_from_slice(&e);
 
-    // ".."
     let mut e = [0u8; 32];
     e[0..8].copy_from_slice(b"..      ");
     e[8..11].copy_from_slice(b"   ");

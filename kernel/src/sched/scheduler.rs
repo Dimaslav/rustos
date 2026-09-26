@@ -103,7 +103,8 @@ pub fn spawn_with_as(name: &'static str, entry: extern "C" fn() -> !, pml4_phys:
 }
 
 fn spawn_inner(name: &'static str, entry: extern "C" fn() -> !, pml4_phys: Option<u64>) -> ThreadId {
-    let thread = Thread::new_kernel(name, entry, pml4_phys);
+    let parent = current_id();
+    let thread = Thread::new_kernel(name, entry, pml4_phys, parent);
     let id = thread.id;
     let mut g = SCHED.lock();
     match g.as_mut() {
@@ -121,6 +122,55 @@ pub fn current_id() -> ThreadId {
 pub fn current_name() -> &'static str {
     let g = SCHED.lock();
     match g.as_ref() { Some(s) => s.threads[s.current].name, None => "?" }
+}
+
+pub fn parent_of(pid: ThreadId) -> Option<ThreadId> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    s.threads.iter().find(|t| t.id == pid).map(|t| t.parent_id)
+}
+
+pub fn exit_code_of(pid: ThreadId) -> Option<i32> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    s.threads
+        .iter()
+        .find(|t| t.id == pid && t.state == ThreadState::Finished)
+        .map(|t| t.exit_code)
+}
+
+pub fn wait_for(pid: ThreadId) -> Option<i32> {
+    let mut guard = 0u32;
+    loop {
+        guard += 1;
+        if guard > 300_000 { return None; }
+        {
+            let g = SCHED.lock();
+            let s = g.as_ref()?;
+            let t = s.threads.iter().find(|t| t.id == pid);
+            match t {
+                Some(t) if t.state == ThreadState::Finished => {
+                    return Some(t.exit_code);
+                }
+                None => return None,
+                _ => {}
+            }
+        }
+        sleep_ms(10);
+    }
+}
+
+pub fn kill(pid: ThreadId) -> bool {
+    let mut g = SCHED.lock();
+    let s = match g.as_mut() { Some(s) => s, None => return false };
+    for t in s.threads.iter_mut() {
+        if t.id == pid && t.state != ThreadState::Finished {
+            t.state = ThreadState::Finished;
+            t.exit_code = -9;
+            return true;
+        }
+    }
+    false
 }
 
 pub fn schedule_tick() {
@@ -231,13 +281,14 @@ pub fn wake_thread(id: ThreadId) {
     }
 }
 
-pub fn exit_current() -> ! {
+pub fn exit_current_with_code(code: i32) -> ! {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let switch = {
             let mut g = SCHED.lock();
             let s = match g.as_mut() { Some(s) => s, None => return };
             let cur = s.current;
             s.threads[cur].state = ThreadState::Finished;
+            s.threads[cur].exit_code = code;
             let next = match s.pick_next() { Some(n) => n, None => return };
             s.threads[next].state = ThreadState::Running;
             let ptr = s.threads[cur].rsp_slot();
@@ -252,15 +303,28 @@ pub fn exit_current() -> ! {
     loop { x86_64::instructions::hlt(); }
 }
 
+pub fn exit_current() -> ! {
+    exit_current_with_code(0)
+}
+
 pub fn reap_finished() -> usize {
     x86_64::instructions::interrupts::without_interrupts(|| {
+        // Сначала соберём id завершённых потоков, потом освободим их fd.
+        let mut to_close_fds: Vec<ThreadId> = Vec::new();
         let mut g = SCHED.lock();
         let s = match g.as_mut() { Some(s) => s, None => return 0 };
         let cur_id = s.threads[s.current].id;
+
         let mut reaped = 0usize;
         let mut i = 0;
         while i < s.threads.len() {
             if s.threads[i].id != cur_id && s.threads[i].state == ThreadState::Finished {
+                let has_waiter = s.threads.iter().any(|t| t.parent_id == s.threads[i].id);
+                if has_waiter {
+                    i += 1;
+                    continue;
+                }
+                to_close_fds.push(s.threads[i].id);
                 s.threads.remove(i);
                 reaped += 1;
             } else {
@@ -272,6 +336,43 @@ pub fn reap_finished() -> usize {
         } else {
             s.current = 0;
         }
+        drop(g);
+
+        for pid in to_close_fds {
+            crate::fd::close_all_for_pid(pid);
+        }
         reaped
     })
+}
+
+// ---------- ps ----------
+
+#[derive(Clone, Copy)]
+pub struct ThreadInfo {
+    pub id: ThreadId,
+    pub state: u8,
+    pub name: [u8; 32],
+}
+
+pub fn list_threads_snapshot() -> Vec<ThreadInfo> {
+    let g = SCHED.lock();
+    let s = match g.as_ref() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(s.threads.len());
+    for t in &s.threads {
+        let state = match t.state {
+            ThreadState::Ready => 0,
+            ThreadState::Running => 1,
+            ThreadState::Sleeping => 2,
+            ThreadState::Finished => 3,
+        };
+        let mut name = [0u8; 32];
+        let nb = t.name.as_bytes();
+        let n = nb.len().min(31);
+        name[..n].copy_from_slice(&nb[..n]);
+        out.push(ThreadInfo { id: t.id, state, name });
+    }
+    out
 }

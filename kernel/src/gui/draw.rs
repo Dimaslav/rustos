@@ -81,6 +81,11 @@ impl Wm {
         }
 
         self.draw_toasts(w);
+
+        // Tooltip — поверх всего, но под курсором (курсор рисуется отдельно).
+        if let Some((text, tx, ty)) = &self.tooltip {
+            widgets::tooltip(w, (*tx).max(0) as usize, (*ty).max(0) as usize, text);
+        }
     }
 
     fn draw_switcher(&self, w: &mut Writer) {
@@ -159,7 +164,6 @@ impl Wm {
                 w.fill_round_rect_aa(x, y, toast_w, toast_h, 8, p.window_bg_alt);
                 w.fill_round_rect_aa(x, y, 4, toast_h, 2, accent);
                 w.draw_text_at(x + 14, y + (toast_h - FONT_HEIGHT) / 2, &t.text, p.text, p.window_bg_alt);
-                // Полупрозрачный слой фона поверх toast'а — эффект затухания.
                 let wp_color = p.wallpaper_top;
                 let inv = 255 - alpha;
                 if inv > 0 {
@@ -211,8 +215,15 @@ impl Wm {
         w.fill_round_rect_aa(x, y, ww, wh, 10, p.window_bg);
 
         let title_bg = if active { p.title_active } else { p.title_inactive };
-        w.fill_round_rect_aa(x, y, ww, TITLE_H + 10, 10, title_bg);
-        w.fill_rect(x, y + TITLE_H, ww, 10, p.window_bg);
+        let title_alpha = if active { p.title_alpha } else { 255 };
+
+        if title_alpha < 255 {
+            w.fill_round_rect_aa_blend(x, y, ww, TITLE_H + 10, 10, title_bg, title_alpha);
+            w.fill_rect(x, y + TITLE_H, ww, 10, p.window_bg);
+        } else {
+            w.fill_round_rect_aa(x, y, ww, TITLE_H + 10, 10, title_bg);
+            w.fill_rect(x, y + TITLE_H, ww, 10, p.window_bg);
+        }
         w.draw_text_at(x + 14, y + (TITLE_H - FONT_HEIGHT) / 2, &win.title, p.text, title_bg);
 
         let cb_x = x + ww.saturating_sub(12 + CLOSE_BTN_W);
@@ -231,8 +242,8 @@ impl Wm {
             App::Explorer { path, selected, mode, scroll, .. } => {
                 self.draw_explorer(w, win, path, selected, mode, *scroll)
             }
-            App::Todo { items, selected, input } => {
-                self.draw_todo(w, win, items, *selected, input)
+            App::Todo { items, checked, selected, input } => {
+                self.draw_todo(w, win, items, checked, *selected, input)
             }
             App::Calculator { display, .. } => self.draw_calc(w, win, display),
             App::Paint { canvas, w: cw, h: chh, .. } => {
@@ -419,7 +430,7 @@ impl Wm {
         w.draw_text_at(view_x + view_w.saturating_sub(120), view_y + 10, "Размер", p.text_muted, view_bg);
 
         let entries: Vec<(String, bool, u32)> = if on_disk {
-            crate::vfs::fat32_list_root()
+            crate::vfs::fat32_list_dir(path)
         } else {
             crate::vfs::ramfs_list_meta(path)
                 .into_iter()
@@ -450,17 +461,13 @@ impl Wm {
             }
         }
 
+        // Новый scrollbar_v из widgets.
         if max_scroll > 0 {
             let sb_x = view_x + view_w - SCROLLBAR_W - 2;
             let sb_y = view_y + 34;
             let sb_h = view_h.saturating_sub(34);
-            w.fill_round_rect(sb_x, sb_y, SCROLLBAR_W, sb_h, 4, p.window_bg_alt);
-            let thumb_h = (sb_h as f32 / (total as f32 / max_rows as f32)) as usize;
-            let thumb_h = thumb_h.max(20).min(sb_h);
-            let denom = max_scroll.max(1) as f32;
-            let frac = scroll as f32 / denom;
-            let thumb_y = sb_y + ((sb_h - thumb_h) as f32 * frac) as usize;
-            w.fill_round_rect(sb_x + 1, thumb_y, SCROLLBAR_W - 2, thumb_h, 4, p.text_muted);
+            widgets::scrollbar_v(w, sb_x, sb_y, SCROLLBAR_W, sb_h,
+                scroll, max_scroll, total, max_rows);
         }
 
         let dlg: Option<(String, &str, bool)> = match mode {
@@ -499,7 +506,15 @@ impl Wm {
         }
     }
 
-    fn draw_todo(&self, w: &mut Writer, win: &Window, items: &[String], selected: Option<usize>, input: &str) {
+    fn draw_todo(
+        &self,
+        w: &mut Writer,
+        win: &Window,
+        items: &[String],
+        checked: &[bool],
+        selected: Option<usize>,
+        input: &str,
+    ) {
         let p = theme::palette();
         let x = win.x.max(0) as usize;
         let y = win.y.max(0) as usize;
@@ -516,7 +531,52 @@ impl Wm {
         let list_y = field_y + widgets::FIELD_H + 12;
         let list_w = win.w.saturating_sub(pad * 2);
         let list_h = win.h.saturating_sub(TITLE_H + widgets::FIELD_H + 4 * pad + widgets::BUTTON_H);
-        widgets::list_box_modern(w, list_x, list_y, list_w, list_h, items, selected);
+        let list_bg = p.field_bg;
+        w.fill_round_rect(list_x, list_y, list_w, list_h, 4, list_bg);
+
+        let row_h = 28usize;
+        let max_rows = (list_h.saturating_sub(12)) / row_h;
+        for (i, item) in items.iter().take(max_rows).enumerate() {
+            let iy = list_y + 6 + i * row_h;
+            let is_sel = selected == Some(i);
+            let is_chk = checked.get(i).copied().unwrap_or(false);
+            if is_sel {
+                w.fill_round_rect(list_x + 4, iy, list_w - 8, row_h - 2, 4, p.accent);
+            }
+            // Checkbox 18x18 слева.
+            let cb_x = list_x + 12;
+            let cb_y = iy + (row_h - 18) / 2;
+            let cb_size = 18usize;
+            let box_bg = if is_sel { p.accent } else { p.window_bg_alt };
+            w.fill_round_rect(cb_x, cb_y, cb_size, cb_size, 4, box_bg);
+            for k in 0..cb_size {
+                w.set_pixel(cb_x, cb_y + k, p.border);
+                w.set_pixel(cb_x + cb_size - 1, cb_y + k, p.border);
+                w.set_pixel(cb_x + k, cb_y, p.border);
+                w.set_pixel(cb_x + k, cb_y + cb_size - 1, p.border);
+            }
+            if is_chk {
+                let cx = cb_x + cb_size / 2;
+                let cy = cb_y + cb_size / 2;
+                for k in 0..5 {
+                    w.set_pixel(cx - 5 + k, cy + k - 1, p.accent);
+                    w.set_pixel(cx - 5 + k, cy + k, p.accent);
+                }
+                for k in 0..8 {
+                    w.set_pixel(cx - 1 + k, cy - 1 - k + 4, p.accent);
+                    w.set_pixel(cx - 1 + k, cy - k + 4, p.accent);
+                }
+            }
+            // Текст. Если отмечено — серым.
+            let (fg, bg) = if is_sel {
+                (Color::WHITE, p.accent)
+            } else if is_chk {
+                (p.text_muted, list_bg)
+            } else {
+                (p.text, list_bg)
+            };
+            w.draw_text_at(cb_x + cb_size + 10, iy + (row_h - FONT_HEIGHT) / 2, item, fg, bg);
+        }
 
         let remove_btn_y = list_y + list_h + 10;
         widgets::button_modern(w, list_x, remove_btn_y, 120, widgets::BUTTON_H, "Удалить", p.danger, Color::WHITE, false);
@@ -570,7 +630,11 @@ impl Wm {
         let h = w.height;
         let y = h.saturating_sub(TASKBAR_H);
 
-        w.fill_rect(0, y, w.width, TASKBAR_H, p.taskbar_bg);
+        if p.blur_radius > 0 {
+            w.blur_rect(0, y, w.width, TASKBAR_H, p.blur_radius);
+        }
+
+        w.fill_rect_blend(0, y, w.width, TASKBAR_H, p.taskbar_bg, p.taskbar_alpha);
         w.fill_rect(0, y, w.width, 1, p.border);
 
         let start_hover = widgets::hit(self.hover.0, self.hover.1, 6, y + 6, 70, TASKBAR_H.saturating_sub(12));
@@ -601,8 +665,12 @@ impl Wm {
         let menu_x = 6;
         let menu_y = h.saturating_sub(TASKBAR_H + menu_h + 6);
 
-        w.fill_round_rect(menu_x + 4, menu_y + 4, menu_w, menu_h, 12, p.shadow);
-        w.fill_round_rect(menu_x, menu_y, menu_w, menu_h, 12, p.window_bg_alt);
+        if p.blur_radius > 0 {
+            w.blur_rect(menu_x, menu_y, menu_w, menu_h, p.blur_radius);
+        }
+
+        w.fill_round_rect_aa(menu_x + 4, menu_y + 4, menu_w, menu_h, 12, p.shadow);
+        w.fill_round_rect_aa_blend(menu_x, menu_y, menu_w, menu_h, 12, p.window_bg_alt, p.menu_alpha);
 
         w.draw_text_at(menu_x + 16, menu_y + 14, "Rust OS", p.text, p.window_bg_alt);
         w.draw_text_at(menu_x + 16, menu_y + 14 + FONT_HEIGHT, "v0.9", p.text_muted, p.window_bg_alt);
@@ -611,7 +679,9 @@ impl Wm {
             let iy = menu_y + 60 + i * 32;
             let hover = widgets::hit(self.hover.0, self.hover.1, menu_x + 8, iy, menu_w.saturating_sub(16), 28);
             let bg = if hover { p.accent } else { p.window_bg_alt };
-            w.fill_round_rect(menu_x + 8, iy, menu_w.saturating_sub(16), 28, 6, bg);
+            if hover {
+                w.fill_round_rect(menu_x + 8, iy, menu_w.saturating_sub(16), 28, 6, bg);
+            }
             w.draw_text_at(menu_x + 20, iy + 5, item, p.text, bg);
         }
     }
@@ -646,7 +716,6 @@ fn draw_foreign(w: &mut Writer, fw: &crate::win::ForeignWindow) {
     }
 }
 
-/// Рисует BMP-обои с nearest-neighbor масштабированием под экран.
 fn draw_wallpaper(w: &mut Writer, wp: &super::WallpaperBuf) {
     if wp.width == 0 || wp.height == 0 { return; }
     let scr_w = w.width;

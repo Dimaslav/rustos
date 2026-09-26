@@ -1,0 +1,61 @@
+INFO : Framebuffer info: FrameBufferInfo { byte_len: 2764800, width: 1280, height: 720, pixel_format: Bgr, bytes_per_pixel: 3, stride: 1280 }
+INFO : 4th Stage
+INFO : BiosInfo { stage_4: Region { start: 130000, len: 25188 }, kernel: Region { start: 1000000, len: 813898 }, ramdisk: Region { start: 1814000, len: 0 }, config_file: Region { start: 1814000, len: 0 }, last_used_addr: 1813fff, framebuffer: BiosFramebufferInfo { region: Region { start: fd000000, len: 2a3000 }, width: 500, height: 2d0, bytes_per_pixel: 3, stride: 500, pixel_format: Bgr }, memory_map_addr: 1212c, memory_map_len: 7 }
+INFO : BIOS boot
+INFO : Elf file loaded at Pointer {
+    addr: 0x0000000001000000,
+    metadata: 8468632,
+}
+INFO : virtual_address_offset: 0x10000000000
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(4), offset: 0, virtual_addr: 0, physical_addr: 0, file_size: 20914, mem_size: 20914, align: 1000 })
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(5), offset: 20920, virtual_addr: 21920, physical_addr: 21920, file_size: 27aae, mem_size: 27aae, align: 1000 })
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(6), offset: 483d0, virtual_addr: 4a3d0, physical_addr: 4a3d0, file_size: 7550, mem_size: 7c30, align: 1000 })
+INFO : Mapping bss section
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(6), offset: 4f920, virtual_addr: 52920, physical_addr: 52920, file_size: 654, mem_size: 17ae, align: 1000 })
+INFO : Mapping bss section
+INFO : Entry point at: 0x10000043ca0
+INFO : Creating GDT at PhysAddr(0x183d000)
+INFO : Map framebuffer
+INFO : Map physical memory
+INFO : Allocate bootinfo
+INFO : Create Memory Map
+INFO : Create bootinfo
+INFO : Jumping to kernel entry point at VirtAddr(0x10000043ca0)
+[K1]
+[K2]
+[INFO ] [boot] 1. serial online
+[INFO ] [boot] 2. phys_offset = Some(2748779069440)
+[INFO ] [boot] 3. phys_offset = 0x28000000000
+[mem] allocator init: next_region = 3, next_addr = 0x100000
+[INFO ] [boot] 7. heap = 33554432 bytes
+[INFO ] [boot] 8. framebuffer 1280x720 (24 bpp)
+[INFO ] [boot] 8.5 GDT/TSS ready
+[INFO ] [mbr] found 2 partitions
+[INFO ] [mbr] mounting FAT32 at LBA 962
+[INFO ] [fat32] mounted, 0 root entries
+[INFO ] [pic] master mask = 0b11111000, slave mask = 0b11101111
+[mouse] i8042 config: before=0b01000001 wrote=0b01000011 verify=0b01000011
+[mouse] device id = 0x3, wheel = true
+[mouse] F4 ack = 0xfa (ожидаем 0xFA)
+[INFO ] [boot] 9. interrupts ready
+[TEST] === smoke tests begin ===
+[TEST PASS] heap_alloc_1000
+[TEST PASS] format_basic
+[TEST PASS] vec_sum_4950
+[TEST PASS] ramfs_create_file
+[TEST PASS] ramfs_read_back
+[TEST PASS] ramfs_mkdir
+[TEST PASS] ramfs_exists_after_mkdir
+[TEST PASS] ramfs_remove
+[TEST PASS] vfs_list_root
+[TEST SKIP] fat32_mounted (no FAT32 mounted)
+[TEST PASS] timer_advances
+[TEST PASS] wait_exit_code_42
+[TEST PASS] kill_returns_true
+[TEST PASS] kill_exit_code_neg
+[TEST PASS] getppid_matches
+[TEST SKIP] fat32_subdirs (no FAT32 mounted)
+[TEST PASS] time_ms_no_overflow
+[TEST] === smoke tests end: passed=15 failed=0 ===
+SMOKE_TEST_PASS
+[power] shutdown requested

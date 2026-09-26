@@ -1,8 +1,4 @@
 //! Палитры светлой/тёмной темы.
-//!
-//! Переключение: `theme::toggle()`. Все виджеты и окна читают цвета через
-//! `theme::palette()`, которая возвращает `&'static Palette` в зависимости
-//! от глобального счётчика.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 use crate::framebuffer::Color;
@@ -25,6 +21,15 @@ pub struct Palette {
     pub wallpaper_top: Color,
     pub wallpaper_bottom: Color,
     pub taskbar_bg: Color,
+    // --- визуальные эффекты ---
+    /// Прозрачность панели задач (0–255). Меньше = прозрачнее.
+    pub taskbar_alpha: u8,
+    /// Прозрачность стартового меню.
+    pub menu_alpha: u8,
+    /// Прозрачность заголовка активного окна.
+    pub title_alpha: u8,
+    /// Радиус box blur под панелями. 0 = выключено.
+    pub blur_radius: usize,
 }
 
 pub const DARK: Palette = Palette {
@@ -44,6 +49,10 @@ pub const DARK: Palette = Palette {
     wallpaper_top:    Color { r: 18,  g: 22,  b: 34  },
     wallpaper_bottom: Color { r: 40,  g: 30,  b: 60  },
     taskbar_bg:       Color { r: 22,  g: 24,  b: 32  },
+    taskbar_alpha:    200,
+    menu_alpha:       220,
+    title_alpha:      235,
+    blur_radius:      6,
 };
 
 pub const LIGHT: Palette = Palette {
@@ -63,9 +72,13 @@ pub const LIGHT: Palette = Palette {
     wallpaper_top:    Color { r: 205, g: 215, b: 240 },
     wallpaper_bottom: Color { r: 230, g: 220, b: 245 },
     taskbar_bg:       Color { r: 235, g: 237, b: 242 },
+    taskbar_alpha:    215,
+    menu_alpha:       230,
+    title_alpha:      240,
+    blur_radius:      6,
 };
 
-static THEME: AtomicU8 = AtomicU8::new(0); // 0 = Dark, 1 = Light
+static THEME: AtomicU8 = AtomicU8::new(0);
 
 #[inline]
 pub fn palette() -> &'static Palette {

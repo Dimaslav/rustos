@@ -13,15 +13,19 @@ pub mod cyrillic_font;
 pub mod disk;
 pub mod elf;
 pub mod fat32;
+pub mod fd;
 pub mod framebuffer;
 pub mod fs;
 pub mod gdt;
 pub mod gui;
+pub mod image;
 pub mod interrupts;
 pub mod keyboard;
 pub mod log;
 pub mod memory;
 pub mod mouse;
+pub mod pipe;
+pub mod png;
 pub mod power;
 pub mod sched;
 pub mod serial;
@@ -53,16 +57,13 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 /// Аварийный вывод в COM1 — работает даже до `serial::init`.
-/// В отличие от `serial_println!`, не требует инициализированного serial.
 unsafe fn emergency(s: &str) {
     use x86_64::instructions::port::Port;
     let mut data: Port<u8> = Port::new(0x3F8);
     let mut lsr: Port<u8> = Port::new(0x3FD);
     for b in s.bytes() {
         for _ in 0..1_000_000 {
-            if lsr.read() & 0x20 != 0 {
-                break;
-            }
+            if lsr.read() & 0x20 != 0 { break; }
         }
         data.write(b);
     }
@@ -77,10 +78,8 @@ macro_rules! stage {
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     stage!("K1");
 
-    // Инициализация serial — теперь log::* будет работать.
     serial::init();
 
-    // Уровень по умолчанию. Info для нормального запуска, Debug для тестов.
     log::set_level(if cfg!(feature = "headless_test") {
         log::Level::Debug
     } else {
@@ -199,9 +198,7 @@ extern "C" fn demo_thread() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // emergency — до того, как serial мог быть в рабочем состоянии.
     unsafe { emergency("\n!!PANIC!!\n"); }
-    // serial_println! пишет напрямую, минуя log-level.
     crate::serial_println!("PANIC: {}", info);
     if let Some(loc) = info.location() {
         crate::serial_println!("  at {}:{}", loc.file(), loc.line());

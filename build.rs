@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const USER_BINS: [&str; 8] = ["user", "worker", "calculator", "shell", "echo", "ls", "cat", "ps"];
+
 fn main() {
     build_user_programs();
 
@@ -8,7 +10,6 @@ fn main() {
     let kernel_dir = PathBuf::from("kernel");
     let kernel_target = "x86_64-unknown-none";
 
-    // Пробрасываем фичу headless_test в kernel, если она включена у root-пакета.
     let headless = std::env::var("CARGO_FEATURE_HEADLESS_TEST").is_ok();
     let mut kernel_args: Vec<&str> = vec![
         "build", "--release", "--target", kernel_target,
@@ -47,7 +48,7 @@ fn main() {
     println!("cargo:rerun-if-changed=user");
     println!("cargo:rerun-if-changed=user/linker.ld");
     println!("cargo:rerun-if-changed=user/.cargo/config.toml");
-    for name in ["user", "worker", "calculator", "shell"] {
+    for name in USER_BINS.iter() {
         println!("cargo:rerun-if-changed=kernel/{}.elf", name);
     }
 }
@@ -62,7 +63,7 @@ fn build_user_programs() {
             "build",
             "--release",
             "--target", target,
-            "-Zbuild-std=core,compiler_builtins",
+            "-Zbuild-std=core,alloc,compiler_builtins",
             "-Zbuild-std-features=compiler-builtins-mem",
         ])
         .status()
@@ -71,7 +72,7 @@ fn build_user_programs() {
         panic!("Сборка user-программ завершилась с ошибкой");
     }
 
-    for name in ["user", "worker", "calculator", "shell"] {
+    for name in USER_BINS.iter() {
         let base = user_dir.join("target").join(target).join("release");
         let a = base.join(name);
         let b = base.join(format!("{}.exe", name));
@@ -101,7 +102,6 @@ fn build_user_programs() {
     }
 }
 
-/// Сдвигает ELF с базы 0 на базу `base`.
 fn fixup_elf_base(path: &Path, base: u64) -> Result<(), String> {
     let mut bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     if bytes.len() < 64 || &bytes[0..4] != b"\x7FELF" {

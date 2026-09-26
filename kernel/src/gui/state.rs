@@ -32,7 +32,9 @@ pub const START_MENU_ITEMS: [&str; 6] = [
 
 pub const START_MENU_H: usize = 272;
 
-/// Зона автоматической подгонки окна при перетаскивании к краю экрана.
+/// Толщина невидимой рамки вокруг окна, за которую можно ресайзить.
+pub const RESIZE_EDGE: i32 = 6;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SnapZone {
     Left,
@@ -86,9 +88,7 @@ pub enum App {
         file: Option<String>,
         modified: bool,
         mode: NotepadMode,
-        /// Индекс символа (не байта), где стоит курсор.
         cursor: usize,
-        /// Если `Some`, есть активное выделение от этого индекса до `cursor`.
         selection_anchor: Option<usize>,
     },
     Explorer {
@@ -104,6 +104,7 @@ pub enum App {
     },
     Todo {
         items: Vec<String>,
+        checked: Vec<bool>,
         selected: Option<usize>,
         input: String,
     },
@@ -145,6 +146,24 @@ pub struct Drag {
     pub(in crate::gui) idx: usize,
     pub(in crate::gui) ox: i32,
     pub(in crate::gui) oy: i32,
+}
+
+/// Направление ресайза окна.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ResizeDir {
+    N, S, E, W, NE, NW, SE, SW,
+}
+
+/// Состояние активного ресайза.
+pub struct ResizeDrag {
+    pub idx: usize,
+    pub dir: ResizeDir,
+    pub mx0: i32,
+    pub my0: i32,
+    pub wx0: i32,
+    pub wy0: i32,
+    pub ww0: i32,
+    pub wh0: i32,
 }
 
 pub const CURSOR: &[(i32, i32, u8)] = &[

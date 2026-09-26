@@ -130,10 +130,12 @@ impl Writer {
         mx: i32,
         my: i32,
         pixels: &[(i32, i32, u8)],
+        cw: i32,
+        ch: i32,
     ) -> ((i32, i32, i32, i32), (i32, i32, i32, i32)) {
         let old_rect = if let Some((ox, oy)) = self.last_cursor {
-            self.copy_rect_from_scene(ox, oy, CURSOR_W, CURSOR_H);
-            (ox - 1, oy - 1, CURSOR_W + 2, CURSOR_H + 2)
+            self.copy_rect_from_scene(ox - 1, oy - 1, cw + 2, ch + 2);
+            (ox - 1, oy - 1, cw + 2, ch + 2)
         } else {
             (0, 0, 0, 0)
         };
@@ -147,7 +149,7 @@ impl Writer {
         }
         self.last_cursor = Some((mx, my));
 
-        let new_rect = (mx - 1, my - 1, CURSOR_W + 2, CURSOR_H + 2);
+        let new_rect = (mx - 1, my - 1, cw + 2, ch + 2);
         (old_rect, new_rect)
     }
 
@@ -168,6 +170,31 @@ impl Writer {
         }
     }
 
+    /// Возвращает цвет пикселя по координатам, или None если вне экрана.
+    #[inline]
+    pub fn get_pixel(&self, x: usize, y: usize) -> Option<Color> {
+        if x >= self.width || y >= self.height { return None; }
+        let off = y * self.stride * self.bpp + x * self.bpp;
+        match self.format {
+            PixelFormat::Rgb => Some(Color {
+                r: self.back[off],
+                g: self.back[off + 1],
+                b: self.back[off + 2],
+            }),
+            PixelFormat::Bgr => Some(Color {
+                r: self.back[off + 2],
+                g: self.back[off + 1],
+                b: self.back[off],
+            }),
+            PixelFormat::U8 => {
+                let v = self.back[off];
+                Some(Color { r: v, g: v, b: v })
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn set_pixel(&mut self, x: usize, y: usize, color: Color) {
         if x >= self.width || y >= self.height { return; }
         let offset = y * self.stride * self.bpp + x * self.bpp;
@@ -226,6 +253,163 @@ impl Writer {
         for yy in y..y1 {
             for xx in x..x1 {
                 self.set_pixel(xx, yy, color);
+            }
+        }
+    }
+
+    /// Заливает прямоугольник цветом с alpha-смешением.
+    pub fn fill_rect_blend(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        color: Color,
+        alpha: u8,
+    ) {
+        if alpha == 0 { return; }
+        if alpha == 255 {
+            self.fill_rect(x, y, w, h, color);
+            return;
+        }
+        let x1 = (x + w).min(self.width);
+        let y1 = (y + h).min(self.height);
+        let a = alpha as u32;
+        let inv = 255 - a;
+        for yy in y..y1 {
+            for xx in x..x1 {
+                let off = yy * self.stride * self.bpp + xx * self.bpp;
+                let (r, g, b) = match self.format {
+                    PixelFormat::Rgb => (self.back[off], self.back[off + 1], self.back[off + 2]),
+                    PixelFormat::Bgr => (self.back[off + 2], self.back[off + 1], self.back[off]),
+                    _ => return,
+                };
+                let nr = ((color.r as u32 * a + r as u32 * inv) / 255) as u8;
+                let ng = ((color.g as u32 * a + g as u32 * inv) / 255) as u8;
+                let nb = ((color.b as u32 * a + b as u32 * inv) / 255) as u8;
+                match self.format {
+                    PixelFormat::Rgb => {
+                        self.back[off] = nr;
+                        self.back[off + 1] = ng;
+                        self.back[off + 2] = nb;
+                    }
+                    PixelFormat::Bgr => {
+                        self.back[off] = nb;
+                        self.back[off + 1] = ng;
+                        self.back[off + 2] = nr;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Box blur по региону `(x, y, w, h)` радиусом `radius`.
+    ///
+    /// Реализация: два прохода (горизонтальный и вертикальный) — O(w·h·r),
+    /// но с малым `r` (2–8) это быстрее прямого O(w·h·r²).
+    pub fn blur_rect(&mut self, x: usize, y: usize, w: usize, h: usize, radius: usize) {
+        if radius == 0 || w == 0 || h == 0 { return; }
+        if self.bpp < 3 { return; }
+        let x1 = (x + w).min(self.width);
+        let y1 = (y + h).min(self.height);
+        if x1 <= x || y1 <= y { return; }
+        let rw = x1 - x;
+        let rh = y1 - y;
+        let r = radius;
+
+        // Временные буферы: RGB 3 байта на пиксель.
+        let mut tmp = vec![0u8; rw * rh * 3];
+        let mut out = vec![0u8; rw * rh * 3];
+
+        // Забираем исходные пиксели.
+        for yy in 0..rh {
+            for xx in 0..rw {
+                let src_off = (y + yy) * self.stride * self.bpp + (x + xx) * self.bpp;
+                let (r_, g_, b_) = match self.format {
+                    PixelFormat::Rgb => (
+                        self.back[src_off],
+                        self.back[src_off + 1],
+                        self.back[src_off + 2],
+                    ),
+                    PixelFormat::Bgr => (
+                        self.back[src_off + 2],
+                        self.back[src_off + 1],
+                        self.back[src_off],
+                    ),
+                    _ => return,
+                };
+                let dst = (yy * rw + xx) * 3;
+                tmp[dst] = r_;
+                tmp[dst + 1] = g_;
+                tmp[dst + 2] = b_;
+            }
+        }
+
+        // Горизонтальный проход: tmp → out.
+        for yy in 0..rh {
+            for xx in 0..rw {
+                let mut sr = 0u32;
+                let mut sg = 0u32;
+                let mut sb = 0u32;
+                let mut n = 0u32;
+                let lo = xx.saturating_sub(r);
+                let hi = (xx + r + 1).min(rw);
+                for k in lo..hi {
+                    let s = (yy * rw + k) * 3;
+                    sr += tmp[s] as u32;
+                    sg += tmp[s + 1] as u32;
+                    sb += tmp[s + 2] as u32;
+                    n += 1;
+                }
+                let d = (yy * rw + xx) * 3;
+                out[d] = (sr / n) as u8;
+                out[d + 1] = (sg / n) as u8;
+                out[d + 2] = (sb / n) as u8;
+            }
+        }
+
+        // Вертикальный проход: out → tmp.
+        for yy in 0..rh {
+            for xx in 0..rw {
+                let mut sr = 0u32;
+                let mut sg = 0u32;
+                let mut sb = 0u32;
+                let mut n = 0u32;
+                let lo = yy.saturating_sub(r);
+                let hi = (yy + r + 1).min(rh);
+                for k in lo..hi {
+                    let s = (k * rw + xx) * 3;
+                    sr += out[s] as u32;
+                    sg += out[s + 1] as u32;
+                    sb += out[s + 2] as u32;
+                    n += 1;
+                }
+                let d = (yy * rw + xx) * 3;
+                tmp[d] = (sr / n) as u8;
+                tmp[d + 1] = (sg / n) as u8;
+                tmp[d + 2] = (sb / n) as u8;
+            }
+        }
+
+        // Возвращаем в back.
+        for yy in 0..rh {
+            for xx in 0..rw {
+                let src = (yy * rw + xx) * 3;
+                let dst_off = (y + yy) * self.stride * self.bpp + (x + xx) * self.bpp;
+                match self.format {
+                    PixelFormat::Rgb => {
+                        self.back[dst_off] = tmp[src];
+                        self.back[dst_off + 1] = tmp[src + 1];
+                        self.back[dst_off + 2] = tmp[src + 2];
+                    }
+                    PixelFormat::Bgr => {
+                        self.back[dst_off] = tmp[src + 2];
+                        self.back[dst_off + 1] = tmp[src + 1];
+                        self.back[dst_off + 2] = tmp[src];
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -316,10 +500,6 @@ impl Writer {
         }
     }
 
-    /// Anti-aliased закруглённый прямоугольник.
-    ///
-    /// Работает без `f32::sqrt` — использует квадрат расстояния и
-    /// линейное приближение для alpha (погрешность < 1/255).
     pub fn fill_round_rect_aa(
         &mut self, x: usize, y: usize, w: usize, h: usize,
         radius: usize, color: Color,
@@ -355,8 +535,6 @@ impl Writer {
                 } else if d2 >= dr2 {
                     continue;
                 } else {
-                    // alpha = 255 * (dr - d), где d = sqrt(d2).
-                    // Приближаем: dr - d ≈ (dr² - d²) / (2·dr).
                     let t = ((dr2 - d2) / two_dr) * 255.0;
                     if t <= 0.0 { continue; }
                     if t >= 255.0 { 255 } else { t as u8 }
@@ -365,6 +543,60 @@ impl Writer {
                 self.blend_pixel(x + w - 1 - dx, y + dy, color, alpha);
                 self.blend_pixel(x + dx, y + h - 1 - dy, color, alpha);
                 self.blend_pixel(x + w - 1 - dx, y + h - 1 - dy, color, alpha);
+            }
+        }
+    }
+
+    /// Закруглённый прямоугольник с AA **и** alpha-прозрачностью.
+    pub fn fill_round_rect_aa_blend(
+        &mut self, x: usize, y: usize, w: usize, h: usize,
+        radius: usize, color: Color, base_alpha: u8,
+    ) {
+        if base_alpha == 0 { return; }
+        if w == 0 || h == 0 || radius == 0 {
+            self.fill_rect_blend(x, y, w, h, color, base_alpha);
+            return;
+        }
+        if w < 2 * radius || h < 2 * radius {
+            self.fill_rect_blend(x, y, w, h, color, base_alpha);
+            return;
+        }
+        let mul = |a: u8| -> u8 {
+            ((a as u32 * base_alpha as u32) / 255) as u8
+        };
+
+        self.fill_rect_blend(x + radius, y, w - 2 * radius, h, color, base_alpha);
+        self.fill_rect_blend(x, y + radius, radius, h - 2 * radius, color, base_alpha);
+        self.fill_rect_blend(x + w - radius, y + radius, radius, h - 2 * radius, color, base_alpha);
+
+        let r = radius as f32;
+        let cx = r - 0.5;
+        let cy = r - 0.5;
+        let dr = r + 0.5;
+        let dr2 = dr * dr;
+        let r05 = r - 0.5;
+        let r05_2 = r05 * r05;
+        let two_dr = 2.0 * dr;
+
+        for dy in 0..radius {
+            for dx in 0..radius {
+                let ax = dx as f32 - cx;
+                let ay = dy as f32 - cy;
+                let d2 = ax * ax + ay * ay;
+                let aa: u8 = if d2 <= r05_2 {
+                    255
+                } else if d2 >= dr2 {
+                    continue;
+                } else {
+                    let t = ((dr2 - d2) / two_dr) * 255.0;
+                    if t <= 0.0 { continue; }
+                    if t >= 255.0 { 255 } else { t as u8 }
+                };
+                let a = mul(aa);
+                self.blend_pixel(x + dx, y + dy, color, a);
+                self.blend_pixel(x + w - 1 - dx, y + dy, color, a);
+                self.blend_pixel(x + dx, y + h - 1 - dy, color, a);
+                self.blend_pixel(x + w - 1 - dx, y + h - 1 - dy, color, a);
             }
         }
     }
@@ -405,7 +637,6 @@ impl Writer {
     }
 
     fn draw_char_colored(&mut self, c: char, fg: Color, bg: Color) {
-        // 1. Noto (антиалиасинг, ASCII).
         if let Some(bitmap) = get_raster(c, FontWeight::Regular, RasterHeight::Size16) {
             let w = bitmap.width();
             let h = bitmap.height();
@@ -422,13 +653,11 @@ impl Writer {
             return;
         }
 
-        // 2. Кириллица (8×8 → 9×16).
         if let Some(bitmap) = cyrillic_font::get_cyrillic(c) {
             self.draw_8x8(bitmap, fg, bg);
             return;
         }
 
-        // 3. Fallback: '?'.
         if let Some(bitmap) = get_raster('?', FontWeight::Regular, RasterHeight::Size16) {
             let w = bitmap.width();
             let h = bitmap.height();
@@ -445,7 +674,6 @@ impl Writer {
         }
     }
 
-    /// Рисует 8×8 битмап (bit 7 = leftmost), растянутый до 9×16.
     fn draw_8x8(&mut self, bitmap: [u8; 8], fg: Color, bg: Color) {
         for (row, byte) in bitmap.iter().enumerate() {
             for col in 0..8usize {

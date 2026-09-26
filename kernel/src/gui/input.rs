@@ -8,7 +8,7 @@ use crate::fs;
 use crate::interrupts::ticks;
 use crate::keyboard::Key;
 use crate::mouse;
-use crate::widgets::{self, BUTTON_H, FIELD_H, ROW_H};
+use crate::widgets::{self, BUTTON_H, FIELD_H};
 
 use super::anim::RectOnDone;
 use super::chrome::calc_layout;
@@ -17,12 +17,72 @@ use super::state::*;
 use super::theme;
 use super::Wm;
 
-/// Окно «двойного клика» в тиках (~0.33 сек).
 const DOUBLE_CLICK_TICKS: u64 = 6;
+
+/// Высота строки в Todo. Должна совпадать с draw_todo.
+const TODO_ROW_H: usize = 28;
 
 impl Wm {
     pub(in crate::gui) fn on_move(&mut self, x: i32, y: i32) {
         self.hover = (x, y);
+        self.tooltip = None;
+
+        // --- Resize в процессе ---
+        if let Some(rd) = &self.resize_drag {
+            let idx = rd.idx;
+            let dir = rd.dir;
+            let dx = x - rd.mx0;
+            let dy = y - rd.my0;
+            let wx0 = rd.wx0;
+            let wy0 = rd.wy0;
+            let ww0 = rd.ww0;
+            let wh0 = rd.wh0;
+
+            let mut nx = wx0;
+            let mut ny = wy0;
+            let mut nw = ww0;
+            let mut nh = wh0;
+
+            match dir {
+                ResizeDir::E  => { nw += dx; }
+                ResizeDir::W  => { nx += dx; nw -= dx; }
+                ResizeDir::N  => { ny += dy; nh -= dy; }
+                ResizeDir::S  => { nh += dy; }
+                ResizeDir::NE => { ny += dy; nh -= dy; nw += dx; }
+                ResizeDir::NW => { nx += dx; nw -= dx; ny += dy; nh -= dy; }
+                ResizeDir::SE => { nw += dx; nh += dy; }
+                ResizeDir::SW => { nx += dx; nw -= dx; nh += dy; }
+            }
+
+            const MIN_W: i32 = 240;
+            const MIN_H: i32 = 160;
+            if nw < MIN_W {
+                if matches!(dir, ResizeDir::W | ResizeDir::NW | ResizeDir::SW) {
+                    nx = wx0 + ww0 - MIN_W;
+                }
+                nw = MIN_W;
+            }
+            if nh < MIN_H {
+                if matches!(dir, ResizeDir::N | ResizeDir::NW | ResizeDir::NE) {
+                    ny = wy0 + wh0 - MIN_H;
+                }
+                nh = MIN_H;
+            }
+            if nx < 0 { nx = 0; }
+
+            if idx < self.windows.len() {
+                let w = &mut self.windows[idx];
+                w.x = nx;
+                w.y = ny;
+                w.w = nw as usize;
+                w.h = nh as usize;
+                w.restore_rect = None;
+            }
+            self.dirty = true;
+            return;
+        }
+
+        // --- Обычное движение ---
 
         if self.drag.is_some() {
             let (sw, _sh) = mouse::screen_size();
@@ -50,6 +110,30 @@ impl Wm {
         if let Some(idx) = self.painting {
             self.paint_at(idx, x, y);
             self.dirty = true;
+        }
+
+        // Tooltip над иконками рабочего стола.
+        if self.drag.is_none() {
+            let icons_arr = Self::icons();
+            for (i, (_, label, _, _)) in icons_arr.iter().enumerate() {
+                let (ix, iy, iw, ih) = Self::icon_rect(i);
+                if widgets::hit(x, y, ix, iy, iw, ih) {
+                    self.tooltip = Some(((*label).to_string(), x + 12, y + 20));
+                    break;
+                }
+            }
+        }
+
+        // Обновить курсор.
+        self.resize_dir = self.detect_resize_dir(x, y);
+        let new_kind = if self.drag.is_some() || self.painting.is_some() {
+            self.cursor_kind
+        } else {
+            self.cursor_for_pos(x, y)
+        };
+        if new_kind != self.cursor_kind {
+            self.cursor_kind = new_kind;
+            self.cursor_dirty = true;
         }
 
         let active = self.active;
@@ -159,11 +243,6 @@ impl Wm {
         }
     }
 
-    /// Свернуть окно `idx` с анимацией.
-    ///
-    /// Внимание: сначала вычитываем все поля окна в локальные переменные, и
-    /// только потом мутируем `self.windows[idx]` — иначе borrow checker
-    /// ругается на одновременный `&` и `&mut self.windows` (E0502).
     fn minimize_window(&mut self, idx: usize) {
         if idx >= self.windows.len() { return; }
 
@@ -180,7 +259,6 @@ impl Wm {
         self.anim.start_rect(idx, from, to, RectOnDone::Minimize);
     }
 
-    /// Развернуть окно `idx` с анимацией.
     fn restore_window(&mut self, idx: usize) {
         if idx >= self.windows.len() { return; }
         let to = self.windows[idx].restore_rect.take().unwrap_or_else(|| {
@@ -193,19 +271,16 @@ impl Wm {
         self.focus_window(idx);
     }
 
-    /// Максимизировать/восстановить окно `idx`.
     fn toggle_maximize(&mut self, idx: usize) {
         if idx >= self.windows.len() { return; }
         let (sw, sh) = mouse::screen_size();
         let taskbar_h = TASKBAR_H as i32;
         if self.windows[idx].restore_rect.is_some() {
-            // Восстановить.
             let to = self.windows[idx].restore_rect.take().unwrap();
             let win = &self.windows[idx];
             let from = (win.x, win.y, win.w, win.h);
             self.anim.start_rect(idx, from, to, RectOnDone::None);
         } else {
-            // Максимизировать.
             let win = &self.windows[idx];
             let from = (win.x, win.y, win.w, win.h);
             self.windows[idx].restore_rect = Some(from);
@@ -273,7 +348,6 @@ impl Wm {
             self.dirty = true;
         }
 
-        // Taskbar.
         if (y as usize) >= taskbar_y {
             if x < 78 { self.start_pressed = !self.start_pressed; return; }
             let mut bx = 86;
@@ -320,6 +394,23 @@ impl Wm {
             }
         }
 
+        // Resize: если курсор над краем активного окна — начинаем ресайз.
+        if let Some((idx, dir)) = self.detect_resize_dir(x, y) {
+            let w = &self.windows[idx];
+            self.resize_drag = Some(ResizeDrag {
+                idx,
+                dir,
+                mx0: x,
+                my0: y,
+                wx0: w.x,
+                wy0: w.y,
+                ww0: w.w as i32,
+                wh0: w.h as i32,
+            });
+            self.dirty = true;
+            return;
+        }
+
         let mut hit_idx = None;
         for idx in (0..self.windows.len()).rev() {
             if self.windows[idx].minimized { continue; }
@@ -344,7 +435,6 @@ impl Wm {
                     let i = self.active;
                     self.minimize_window(i);
                 } else {
-                    // Двойной клик на заголовке = maximize/restore.
                     let now = ticks();
                     let dbl = matches!(
                         self.last_title_click,
@@ -365,6 +455,16 @@ impl Wm {
     }
 
     pub(in crate::gui) fn on_button_up(&mut self, x: i32, y: i32) {
+        if self.resize_drag.is_some() {
+            self.resize_drag = None;
+            let k = self.cursor_for_pos(x, y);
+            if k != self.cursor_kind {
+                self.cursor_kind = k;
+                self.cursor_dirty = true;
+            }
+            self.dirty = true;
+            return;
+        }
         if self.drag.is_some() {
             if let Some(zone) = self.snap_zone.take() {
                 let (sw, sh) = mouse::screen_size();
@@ -374,21 +474,9 @@ impl Wm {
                     let win = &self.windows[idx];
                     let from = (win.x, win.y, win.w, win.h);
                     let to = match zone {
-                        SnapZone::Left => (
-                            0, 0,
-                            (sw / 2) as usize,
-                            (sh - taskbar_h) as usize,
-                        ),
-                        SnapZone::Right => (
-                            sw / 2, 0,
-                            (sw / 2) as usize,
-                            (sh - taskbar_h) as usize,
-                        ),
-                        SnapZone::Top => (
-                            0, 0,
-                            sw as usize,
-                            (sh - taskbar_h) as usize,
-                        ),
+                        SnapZone::Left => (0, 0, (sw / 2) as usize, (sh - taskbar_h) as usize),
+                        SnapZone::Right => (sw / 2, 0, (sw / 2) as usize, (sh - taskbar_h) as usize),
+                        SnapZone::Top => (0, 0, sw as usize, (sh - taskbar_h) as usize),
                     };
                     self.anim.start_rect(idx, from, to, RectOnDone::None);
                 }
@@ -453,8 +541,8 @@ impl Wm {
                 let entries = self.list_dir_entries(&p);
                 if row < entries.len() {
                     let (name, is_dir, _) = entries[row].clone();
-                    if is_dir && !on_disk {
-                        let full = fs::join(&p, &name);
+                    let full = fs::join(&p, &name);
+                    if is_dir {
                         if let App::Explorer { path, history, selected, anchor, scroll, .. } = &mut self.windows[active].content {
                             history.push(path.clone());
                             *path = full;
@@ -464,8 +552,8 @@ impl Wm {
                         }
                     } else if name.ends_with(".txt") || name.ends_with(".TXT") {
                         if on_disk {
-                            if let Some(text) = self.read_disk_file(&name) {
-                                self.spawn_app(AppKind::Notepad, Some((format!("C:/{}", name), text)));
+                            if let Some(text) = self.read_disk_file(&full) {
+                                self.spawn_app(AppKind::Notepad, Some((full, text)));
                             }
                         } else {
                             let full = fs::join(&p, &name);
@@ -485,10 +573,8 @@ impl Wm {
             }
             "Вставить" => self.paste_clipboard(active),
             "Новая папка" => {
-                if !on_disk {
-                    if let App::Explorer { mode, .. } = &mut self.windows[active].content {
-                        *mode = ExplorerMode::NewFolder { name: String::new() };
-                    }
+                if let App::Explorer { mode, .. } = &mut self.windows[active].content {
+                    *mode = ExplorerMode::NewFolder { name: String::new() };
                 }
             }
             "Новый файл" => {
@@ -529,7 +615,7 @@ impl Wm {
                 }
             }
             App::Explorer { .. } => unreachable!(),
-            App::Todo { items, selected, input } => {
+            App::Todo { items, checked, selected, input } => {
                 let pad = 16;
                 let field_x = wx + pad;
                 let field_y = wy + TITLE_H + pad;
@@ -543,17 +629,37 @@ impl Wm {
 
                 if widgets::hit(mx, my, add_btn_x, field_y, 72, FIELD_H) {
                     let s = input.trim();
-                    if !s.is_empty() { items.push(s.to_string()); input.clear(); }
+                    if !s.is_empty() {
+                        items.push(s.to_string());
+                        checked.push(false);
+                        input.clear();
+                    }
                     return;
                 }
                 if widgets::hit(mx, my, list_x, remove_btn_y, 120, BUTTON_H) {
-                    if let Some(sel) = selected.take() { if sel < items.len() { items.remove(sel); } }
+                    if let Some(sel) = selected.take() {
+                        if sel < items.len() {
+                            items.remove(sel);
+                            if sel < checked.len() { checked.remove(sel); }
+                        }
+                    }
                     return;
                 }
                 if widgets::hit(mx, my, list_x, list_y, list_w, list_h) {
                     let rel = (my as usize).saturating_sub(list_y + 6);
-                    let row = rel / ROW_H;
-                    *selected = if row < items.len() { Some(row) } else { None };
+                    let row = rel / TODO_ROW_H;
+                    if row < items.len() {
+                        *selected = Some(row);
+                        let cb_x = list_x + 12;
+                        let cb_w = 18;
+                        if (mx as usize) >= cb_x && (mx as usize) < cb_x + cb_w {
+                            if row < checked.len() {
+                                checked[row] = !checked[row];
+                            }
+                        }
+                    } else {
+                        *selected = None;
+                    }
                 }
             }
             App::Calculator { .. } => {
@@ -641,8 +747,9 @@ impl Wm {
             if widgets::hit(mx, my, up_x, toolbar_y, 42, EXP_TOOLBAR_H) {
                 if let App::Explorer { path, history, selected, anchor, scroll, .. } = &mut self.windows[idx].content {
                     let cur = path.clone();
-                    if cur != "/" && !cur.starts_with("C:") {
-                        let parent = fs::parent_path(&cur);
+                    if cur != "/" && cur != "C:" && cur != "C:/" {
+                        let mut parent = fs::parent_path(&cur);
+                        if parent == "C:" { parent = "C:/".to_string(); }
                         history.push(cur);
                         *path = parent;
                         selected.clear();
@@ -685,19 +792,10 @@ impl Wm {
                 let p = match &self.windows[idx].content { App::Explorer { path, .. } => path.clone(), _ => return };
                 let sel = match &self.windows[idx].content { App::Explorer { selected, .. } => selected.clone(), _ => Vec::new() };
                 if let Some(&i) = sel.first() {
-                    if p.starts_with("C:") {
-                        let entries = crate::vfs::fat32_list_root();
-                        if let Some((name, _, _)) = entries.get(i) {
-                            if let App::Explorer { mode, .. } = &mut self.windows[idx].content {
-                                *mode = ExplorerMode::Rename { name: name.clone() };
-                            }
-                        }
-                    } else {
-                        let entries = crate::vfs::ramfs_list_meta(&p);
-                        if let Some((name, _, _)) = entries.get(i) {
-                            if let App::Explorer { mode, .. } = &mut self.windows[idx].content {
-                                *mode = ExplorerMode::Rename { name: name.clone() };
-                            }
+                    let entries = self.list_dir_entries(&p);
+                    if let Some((name, _, _)) = entries.get(i) {
+                        if let App::Explorer { mode, .. } = &mut self.windows[idx].content {
+                            *mode = ExplorerMode::Rename { name: name.clone() };
                         }
                     }
                 }
@@ -772,22 +870,20 @@ impl Wm {
 
                 if dbl {
                     let (name, is_dir, _) = entries[row].clone();
+                    let full = fs::join(&p, &name);
                     if is_dir {
-                        if !p.starts_with("C:") {
-                            let full = fs::join(&p, &name);
-                            if let App::Explorer { path, history, selected, anchor, scroll, last_click, .. } = &mut self.windows[idx].content {
-                                history.push(path.clone());
-                                *path = full;
-                                selected.clear();
-                                *anchor = None;
-                                *scroll = 0;
-                                *last_click = None;
-                            }
+                        if let App::Explorer { path, history, selected, anchor, scroll, last_click, .. } = &mut self.windows[idx].content {
+                            history.push(path.clone());
+                            *path = full;
+                            selected.clear();
+                            *anchor = None;
+                            *scroll = 0;
+                            *last_click = None;
                         }
                     } else if name.ends_with(".txt") || name.ends_with(".TXT") {
                         if p.starts_with("C:") {
-                            if let Some(text) = self.read_disk_file(&name) {
-                                self.spawn_app(AppKind::Notepad, Some((format!("C:/{}", name), text)));
+                            if let Some(text) = self.read_disk_file(&full) {
+                                self.spawn_app(AppKind::Notepad, Some((full, text)));
                             }
                         } else {
                             let full = fs::join(&p, &name);
@@ -863,9 +959,12 @@ impl Wm {
             }
         }
 
-        let total_items = match &self.windows[idx].content {
-            App::Explorer { path, .. } => self.list_dir_entries(path).len(),
-            _ => 0,
+        let (total_items, pre_entries) = match &self.windows[idx].content {
+            App::Explorer { path, .. } => {
+                let entries = self.list_dir_entries(path);
+                (entries.len(), entries)
+            }
+            _ => (0, Vec::new()),
         };
 
         let win = &mut self.windows[idx];
@@ -1004,8 +1103,9 @@ impl Wm {
                         Key::Enter => {
                             let n = name.clone();
                             let p = path.clone();
+                            let full = fs::join(&p, &n);
                             let ok = if p.starts_with("C:") {
-                                crate::vfs::fat32_mkdir(&n)
+                                crate::vfs::fat32_mkdir_path(&full)
                             } else {
                                 crate::vfs::ramfs_mkdir(&p, &n)
                             };
@@ -1022,8 +1122,9 @@ impl Wm {
                         Key::Enter => {
                             let n = name.clone();
                             let p = path.clone();
+                            let full = fs::join(&p, &n);
                             if p.starts_with("C:") {
-                                if crate::vfs::fat32_create_file(&n) {
+                                if crate::vfs::fat32_write_path(&full, b"") {
                                     *mode = ExplorerMode::Browse;
                                     self.anim.toast("Файл создан", super::anim::ToastKind::Success);
                                 }
@@ -1042,22 +1143,17 @@ impl Wm {
                             let p = path.clone();
                             let sel = if selected.is_empty() { None } else { Some(selected[0]) };
                             if let Some(i) = sel {
-                                if p.starts_with("C:") {
-                                    let entries = crate::vfs::fat32_list_root();
-                                    if let Some((old, _, _)) = entries.get(i) {
-                                        if crate::vfs::fat32_rename(old, &n) {
-                                            *mode = ExplorerMode::Browse;
-                                            self.anim.toast("Переименовано", super::anim::ToastKind::Success);
-                                        }
-                                    }
-                                } else {
-                                    let entries = crate::vfs::ramfs_list_meta(&p);
-                                    if let Some((old, _, _)) = entries.get(i) {
-                                        let full = fs::join(&p, old);
-                                        if crate::vfs::ramfs_rename(&full, &n) {
-                                            *mode = ExplorerMode::Browse;
-                                            self.anim.toast("Переименовано", super::anim::ToastKind::Success);
-                                        }
+                                let entries = &pre_entries;
+                                if let Some((old, _, _)) = entries.get(i) {
+                                    let full = fs::join(&p, old);
+                                    let ok = if p.starts_with("C:") {
+                                        crate::vfs::fat32_rename_path(&full, &n)
+                                    } else {
+                                        crate::vfs::ramfs_rename(&full, &n)
+                                    };
+                                    if ok {
+                                        *mode = ExplorerMode::Browse;
+                                        self.anim.toast("Переименовано", super::anim::ToastKind::Success);
                                     }
                                 }
                             }
@@ -1069,8 +1165,9 @@ impl Wm {
                     ExplorerMode::Browse => match k {
                         Key::Backspace => {
                             let cur = path.clone();
-                            if cur != "/" && !cur.starts_with("C:") {
-                                let parent = fs::parent_path(&cur);
+                            if cur != "/" && cur != "C:" && cur != "C:/" {
+                                let mut parent = fs::parent_path(&cur);
+                                if parent == "C:" { parent = "C:/".to_string(); }
                                 history.push(cur);
                                 *path = parent;
                                 selected.clear();
@@ -1080,17 +1177,15 @@ impl Wm {
                         }
                         Key::Enter => {
                             if let Some(&i) = selected.first() {
-                                if !path.starts_with("C:") {
-                                    let entries = crate::vfs::ramfs_list_meta(path);
-                                    if let Some((name, is_dir, _)) = entries.get(i) {
-                                        if *is_dir {
-                                            let full = fs::join(path, name);
-                                            history.push(path.clone());
-                                            *path = full;
-                                            selected.clear();
-                                            *anchor = None;
-                                            *scroll = 0;
-                                        }
+                                let entries = &pre_entries;
+                                if let Some((name, is_dir, _)) = entries.get(i) {
+                                    if *is_dir {
+                                        let full = fs::join(path, name);
+                                        history.push(path.clone());
+                                        *path = full;
+                                        selected.clear();
+                                        *anchor = None;
+                                        *scroll = 0;
                                     }
                                 }
                             }
@@ -1102,18 +1197,10 @@ impl Wm {
                             }
                         }
                         Key::F(2) => {
-                            let p = path.clone();
                             if let Some(&i) = selected.first() {
-                                if p.starts_with("C:") {
-                                    let entries = crate::vfs::fat32_list_root();
-                                    if let Some((name, _, _)) = entries.get(i) {
-                                        *mode = ExplorerMode::Rename { name: name.clone() };
-                                    }
-                                } else {
-                                    let entries = crate::vfs::ramfs_list_meta(&p);
-                                    if let Some((name, _, _)) = entries.get(i) {
-                                        *mode = ExplorerMode::Rename { name: name.clone() };
-                                    }
+                                let entries = &pre_entries;
+                                if let Some((name, _, _)) = entries.get(i) {
+                                    *mode = ExplorerMode::Rename { name: name.clone() };
                                 }
                             }
                         }
@@ -1158,15 +1245,40 @@ impl Wm {
                     },
                 }
             }
-            App::Todo { items, input, .. } => match k {
-                Key::Enter => {
-                    let s = input.trim();
-                    if !s.is_empty() { items.push(s.to_string()); input.clear(); }
+            App::Todo { items, checked, selected, input } => {
+                // Специальные клавиши до Char(c), иначе они недостижимы.
+                match k {
+                    Key::Enter => {
+                        let s = input.trim();
+                        if !s.is_empty() {
+                            items.push(s.to_string());
+                            checked.push(false);
+                            input.clear();
+                        }
+                    }
+                    Key::Backspace => { input.pop(); }
+                    Key::Up => {
+                        if let Some(cur) = selected {
+                            if *cur > 0 { *selected = Some(*cur - 1); }
+                        }
+                    }
+                    Key::Down => {
+                        let max = items.len().saturating_sub(1);
+                        if let Some(cur) = selected {
+                            if *cur < max { *selected = Some(*cur + 1); }
+                        }
+                    }
+                    Key::Char(b' ') => {
+                        if let Some(sel) = *selected {
+                            if sel < checked.len() {
+                                checked[sel] = !checked[sel];
+                            }
+                        }
+                    }
+                    Key::Char(c) => input.push(c as char),
+                    _ => {}
                 }
-                Key::Backspace => { input.pop(); }
-                Key::Char(c) => input.push(c as char),
-                _ => {}
-            },
+            }
             App::Calculator { .. } => match k {
                 Key::Char(c) => self.calc_input(c as char),
                 Key::Enter => self.calc_input('='),

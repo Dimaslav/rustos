@@ -1,12 +1,4 @@
 //! Smoke-тесты. Запускаются в `kernel_main` при `feature = "headless_test"`.
-//!
-//! Формат вывода машиночитаемый:
-//!   `[TEST PASS] <name>`
-//!   `[TEST FAIL] <name>: <reason>`
-//!   `[TEST SKIP] <name> (<reason>)`
-//! и в конце: `SMOKE_TEST_PASS` или `SMOKE_TEST_FAIL`.
-//!
-//! `src/main.rs` (root) парсит именно последние строки.
 
 use crate::serial_println;
 
@@ -17,7 +9,6 @@ struct Stats {
 
 impl Stats {
     fn new() -> Self { Self { passed: 0, failed: 0 } }
-
     fn pass(&mut self, name: &str) {
         serial_println!("[TEST PASS] {}", name);
         self.passed += 1;
@@ -84,7 +75,7 @@ pub fn run_all() -> u32 {
 
     // ---------- 4. VFS API ----------
     {
-        let list = crate::vfs::list("/");
+        let list = crate::vfs::list("/").ok().unwrap_or_default();
         let has = list.iter().any(|e| e.name == "smokedir");
         s.check("vfs_list_root", has, "smokedir не видно в листинге /");
     }
@@ -111,20 +102,90 @@ pub fn run_all() -> u32 {
             "ticks не растут (IRQ0 не работает?)");
     }
 
-    // ---------- 7. Scheduler ----------
+    // ---------- 7. Scheduler: spawn + exit code + wait ----------
     {
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-
         extern "C" fn test_thread() -> ! {
-            COUNTER.fetch_add(1, Ordering::SeqCst);
-            crate::sched::exit_current();
+            crate::sched::exit_current_with_code(42);
         }
 
-        crate::sched::spawn("smoke", test_thread);
-        crate::sched::sleep_ms(200);
-        let n = COUNTER.load(Ordering::SeqCst);
-        s.check("sched_spawn_run", n >= 1, "test_thread не выполнился");
+        let id = crate::sched::spawn("smoke_child", test_thread);
+        let code = crate::sched::wait_for(id);
+        s.check("wait_exit_code_42", code == Some(42), "exit code не 42");
+    }
+
+    // ---------- 8. Scheduler: kill ----------
+    {
+        extern "C" fn slow_thread() -> ! {
+            loop { crate::sched::sleep_ms(1000); }
+        }
+
+        let id = crate::sched::spawn("smoke_kill", slow_thread);
+        crate::sched::sleep_ms(50);
+        let killed = crate::sched::kill(id);
+        s.check("kill_returns_true", killed, "kill вернул false");
+
+        let code = crate::sched::wait_for(id);
+        s.check("kill_exit_code_neg", code == Some(-9), "ожидали exit_code = -9");
+    }
+
+    // ---------- 9. getppid ----------
+    {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static CHILD_PPID: AtomicU64 = AtomicU64::new(u64::MAX);
+
+        extern "C" fn child() -> ! {
+            let me = crate::sched::current_id();
+            let ppid = crate::sched::parent_of(me).unwrap_or(u64::MAX);
+            CHILD_PPID.store(ppid, Ordering::SeqCst);
+            crate::sched::exit_current_with_code(0);
+        }
+
+        let me = crate::sched::current_id();
+        let id = crate::sched::spawn("smoke_ppid", child);
+        let _ = crate::sched::wait_for(id);
+        let ppid = CHILD_PPID.load(Ordering::SeqCst);
+        s.check("getppid_matches", ppid == me, "ppid != parent id");
+    }
+
+    // ---------- 10. FAT32 subdirs (soft) ----------
+    {
+        let entries = crate::vfs::fat32_list_root();
+        if entries.is_empty() {
+            s.skip("fat32_subdirs", "no FAT32 mounted");
+        } else {
+            let _ = crate::vfs::fat32_remove_path("C:/__smoke_tmp/a.txt");
+            let _ = crate::vfs::fat32_remove_path("C:/__smoke_tmp");
+
+            let mk = crate::vfs::fat32_mkdir_path("C:/__smoke_tmp");
+            s.check("fat32_mkdir_path", mk, "mkdir не сработал");
+
+            let wr = crate::vfs::fat32_write_path("C:/__smoke_tmp/a.txt", b"hello");
+            s.check("fat32_write_subdir_file", wr, "write не сработал");
+
+            let rd = crate::vfs::fat32_read_path("C:/__smoke_tmp/a.txt");
+            s.check(
+                "fat32_read_subdir_file",
+                rd.as_deref() == Some(b"hello"),
+                "read не совпал",
+            );
+
+            let st = crate::vfs::fat32_stat_path("C:/__smoke_tmp/a.txt");
+            s.check("fat32_stat_file", st == Some((5, false)), "stat не совпал");
+
+            let st_dir = crate::vfs::fat32_stat_path("C:/__smoke_tmp");
+            s.check("fat32_stat_dir", st_dir == Some((0, true)), "stat(dir) не совпал");
+
+            let _ = crate::vfs::fat32_remove_path("C:/__smoke_tmp/a.txt");
+            let rm = crate::vfs::fat32_remove_path("C:/__smoke_tmp");
+            s.check("fat32_remove_dir", rm, "remove(dir) не сработал");
+        }
+    }
+
+    // ---------- 11. time_ms ----------
+    {
+        let t0 = crate::interrupts::ticks();
+        let ms = (t0 * 1000) / 18;
+        s.check("time_ms_no_overflow", ms < u64::MAX / 2, "переполнение");
     }
 
     serial_println!("[TEST] === smoke tests end: passed={} failed={} ===",

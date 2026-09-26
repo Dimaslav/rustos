@@ -2,6 +2,7 @@
 
 pub mod anim;
 pub mod chrome;
+pub mod cursors;
 pub mod draw;
 pub mod icons;
 pub mod input;
@@ -20,6 +21,9 @@ use crate::interrupts::{ticks, TIMER_HZ};
 use crate::keyboard;
 use crate::mouse::{self, MouseButton, MouseEvent};
 use crate::sound;
+use state::TITLE_H;
+
+use cursors::CursorKind;
 
 pub struct WallpaperBuf {
     pub width: usize,
@@ -51,6 +55,12 @@ pub struct Wm {
     pub(in crate::gui) prev_alt: bool,
 
     pub(in crate::gui) wallpaper: Option<WallpaperBuf>,
+    pub(in crate::gui) tooltip: Option<(String, i32, i32)>,
+
+    // --- G3: курсоры и ресайз ---
+    pub(in crate::gui) cursor_kind: CursorKind,
+    pub(in crate::gui) resize_dir: Option<(usize, state::ResizeDir)>,
+    pub(in crate::gui) resize_drag: Option<state::ResizeDrag>,
 }
 
 pub fn run() -> ! {
@@ -116,7 +126,6 @@ pub fn run() -> ! {
             wm.dirty = true;
         }
 
-        // Применяем rect-анимацию к окну + финализируем по завершении.
         let mut finalize: Option<(usize, anim::RectOnDone)> = None;
         if let Some(rc) = &wm.anim.rect_anim {
             let idx = rc.win_idx;
@@ -155,7 +164,7 @@ pub fn run() -> ! {
         if now.saturating_sub(last_stat_tick) >= TIMER_HZ {
             last_stat_tick = now;
             use core::sync::atomic::Ordering;
-            crate::serial_println!(
+            crate::log_debug!(
                 "[stat] tick={} irq_starts={} bytes_irq={} packets={}",
                 now,
                 mouse::IRQ_STARTS.load(Ordering::Relaxed),
@@ -168,14 +177,18 @@ pub fn run() -> ! {
             framebuffer::with_writer(|w| {
                 wm.draw(w);
                 w.end_scene();
-                let _ = w.move_cursor(pos.0, pos.1, CURSOR);
+                let pixels = cursors::bitmap(wm.cursor_kind);
+                let (cw, ch) = cursors::size(wm.cursor_kind);
+                let _ = w.move_cursor(pos.0, pos.1, pixels, cw, ch);
                 w.flush_all();
             });
             wm.dirty = false;
             wm.cursor_dirty = false;
         } else if wm.cursor_dirty {
             framebuffer::with_writer(|w| {
-                let (r1, r2) = w.move_cursor(pos.0, pos.1, CURSOR);
+                let pixels = cursors::bitmap(wm.cursor_kind);
+                let (cw, ch) = cursors::size(wm.cursor_kind);
+                let (r1, r2) = w.move_cursor(pos.0, pos.1, pixels, cw, ch);
                 w.flush_rect(r1.0, r1.1, r1.2, r1.3);
                 w.flush_rect(r2.0, r2.1, r2.2, r2.3);
             });
@@ -210,6 +223,10 @@ impl Wm {
             snap_zone: None,
             prev_alt: false,
             wallpaper: None,
+            tooltip: None,
+            cursor_kind: CursorKind::Arrow,
+            resize_dir: None,
+            resize_drag: None,
         };
         wm.load_wallpaper();
         wm.open_app(AppKind::Explorer);
@@ -217,27 +234,23 @@ impl Wm {
     }
 
     fn load_wallpaper(&mut self) {
-        let names = ["WALLPAPER.BMP", "wallpaper.bmp", "WALLPAPER.bmp"];
-        for name in &names {
-            if let Some(data) = crate::vfs::fat32_read_file(name) {
-                crate::serial_println!("[wallpaper] {} size={}", name, data.len());
-                if let Some(bmp) = crate::bmp::decode(&data) {
-                    crate::serial_println!(
-                        "[wallpaper] decoded {}x{}",
-                        bmp.width, bmp.height
-                    );
-                    self.wallpaper = Some(WallpaperBuf {
-                        width: bmp.width,
-                        height: bmp.height,
-                        pixels: bmp.pixels,
-                    });
-                    return;
-                } else {
-                    crate::serial_println!("[wallpaper] decode failed");
-                }
-            }
+        let names = [
+            "WALLPAPER.PNG", "wallpaper.png", "WALLPAPER.png",
+            "WALLPAPER.BMP", "wallpaper.bmp", "WALLPAPER.bmp",
+        ];
+        if let Some(img) = crate::image::try_names(&names) {
+            crate::log_info!(
+                "[wallpaper] loaded {} ({}x{})",
+                img.name, img.width, img.height
+            );
+            self.wallpaper = Some(WallpaperBuf {
+                width: img.width,
+                height: img.height,
+                pixels: img.pixels.clone(),
+            });
+            return;
         }
-        crate::serial_println!("[wallpaper] no wallpaper, using gradient");
+        crate::log_warn!("[wallpaper] no wallpaper, using gradient");
     }
 
     pub(in crate::gui) fn focus_window(&mut self, idx: usize) {
@@ -364,14 +377,23 @@ impl Wm {
                     )
                 }
             }
-            AppKind::Todo => (
-                "Задачи".to_string(),
-                App::Todo {
-                    items: vec!["Написать UI".to_string(), "Добавить звук".to_string()],
-                    selected: None,
-                    input: String::new(),
-                },
-            ),
+            AppKind::Todo => {
+                let items = vec![
+                    "Написать UI".to_string(),
+                    "Добавить звук".to_string(),
+                    "Проверить чекбоксы".to_string(),
+                ];
+                let checked = vec![false, true, false];
+                (
+                    "Задачи".to_string(),
+                    App::Todo {
+                        items,
+                        checked,
+                        selected: None,
+                        input: String::new(),
+                    },
+                )
+            }
             AppKind::Calculator => (
                 "Калькулятор".to_string(),
                 App::Calculator {
@@ -425,7 +447,7 @@ impl Wm {
 
     pub(in crate::gui) fn list_dir_entries(&self, path: &str) -> Vec<(String, bool, u32)> {
         if path.starts_with("C:") {
-            crate::vfs::fat32_list_root()
+            crate::vfs::fat32_list_dir(path)
         } else {
             crate::vfs::ramfs_list_meta(path)
                 .into_iter()
@@ -434,8 +456,8 @@ impl Wm {
         }
     }
 
-    pub(in crate::gui) fn read_disk_file(&self, name: &str) -> Option<String> {
-        let data = crate::vfs::fat32_read_file(name)?;
+    pub(in crate::gui) fn read_disk_file(&self, path: &str) -> Option<String> {
+        let data = crate::vfs::fat32_read_path(path)?;
         Some(String::from_utf8_lossy(&data).to_string())
     }
 
@@ -459,11 +481,12 @@ impl Wm {
         let mut items: Vec<state::ClipboardItem> = Vec::new();
 
         if on_disk {
-            let entries = crate::vfs::fat32_list_root();
+            let entries = crate::vfs::fat32_list_dir(&p);
             for &i in &selected {
                 if let Some((name, is_dir, _)) = entries.get(i) {
                     if !is_dir {
-                        if let Some(data) = crate::vfs::fat32_read_file(name) {
+                        let full = fs::join(&p, name);
+                        if let Some(data) = crate::vfs::fat32_read_path(&full) {
                             items.push(state::ClipboardItem {
                                 name: name.clone(),
                                 data,
@@ -492,7 +515,7 @@ impl Wm {
         }
 
         if !items.is_empty() {
-            crate::serial_println!("[clip] copied {} items from {}", items.len(), p);
+            crate::log_info!("[clip] copied {} items from {}", items.len(), p);
             self.clipboard = items;
             self.clipboard_from = p;
             self.anim.toast("Скопировано", anim::ToastKind::Info);
@@ -509,8 +532,11 @@ impl Wm {
         let mut pasted = 0usize;
         if on_disk {
             for item in &items {
-                if !item.is_dir && crate::vfs::fat32_write_file(&item.name, &item.data) {
-                    pasted += 1;
+                if !item.is_dir {
+                    let full = fs::join(&p, &item.name);
+                    if crate::vfs::fat32_write_path(&full, &item.data) {
+                        pasted += 1;
+                    }
                 }
             }
         } else {
@@ -538,13 +564,14 @@ impl Wm {
         if selected.is_empty() { return; }
 
         if on_disk {
-            let entries = crate::vfs::fat32_list_root();
+            let entries = crate::vfs::fat32_list_dir(&p);
             let mut sorted = selected.clone();
             sorted.sort();
             sorted.reverse();
             for i in sorted {
                 if let Some((name, _, _)) = entries.get(i) {
-                    crate::vfs::fat32_remove(name);
+                    let full = fs::join(&p, name);
+                    crate::vfs::fat32_remove_path(&full);
                 }
             }
         } else {
@@ -584,5 +611,102 @@ impl Wm {
         let col = i / 4;
         let row = i % 4;
         (ICON_X + col * ICON_STEP, ICON_Y + row * 90, 44, 66)
+    }
+
+    // ---------- G3: определение cursor и resize ----------
+
+    /// Определить, над каким краем активного окна находится курсор.
+    pub(in crate::gui) fn detect_resize_dir(&self, x: i32, y: i32) -> Option<(usize, state::ResizeDir)> {
+        let idx = self.active;
+        if idx >= self.windows.len() { return None; }
+        let w = &self.windows[idx];
+        if w.minimized { return None; }
+        // Нельзя ресайзить во время анимации.
+        if self.anim.rect_anim.is_some() { return None; }
+
+        let e = state::RESIZE_EDGE;
+        let wx = w.x;
+        let wy = w.y;
+        let ww = w.w as i32;
+        let wh = w.h as i32;
+
+        // Заголовок исключаем из верхнего края — там drag.
+        let on_left   = x >= wx - e && x < wx + e;
+        let on_right  = x >= wx + ww - e && x < wx + ww + e;
+        let on_top    = y >= wy - e && y < wy + e;
+        let on_bottom = y >= wy + wh - e && y < wy + wh + e;
+
+        let in_x_zone = x >= wx - e && x < wx + ww + e;
+        let in_y_zone = y >= wy - e && y < wy + wh + e;
+        if !in_x_zone || !in_y_zone { return None; }
+
+        use state::ResizeDir::*;
+        let dir = match (on_left, on_right, on_top, on_bottom) {
+            (true, _, true, _)   => NW,
+            (true, _, _, true)   => SW,
+            (_, true, true, _)   => NE,
+            (_, true, _, true)   => SE,
+            (true, _, _, _)      => W,
+            (_, true, _, _)      => E,
+            (_, _, true, _)      => N,
+            (_, _, _, true)      => S,
+            _ => return None,
+        };
+        Some((idx, dir))
+    }
+
+    /// Определить, над каким краем **любого** окна курсор (для cursor).
+    /// Приоритет — topmost (active).
+    pub(in crate::gui) fn cursor_for_pos(&self, x: i32, y: i32) -> CursorKind {
+        // Resize — только над активным окном.
+        if let Some((_, dir)) = self.detect_resize_dir(x, y) {
+            use state::ResizeDir::*;
+            return match dir {
+                N | S     => CursorKind::ResizeNS,
+                E | W     => CursorKind::ResizeEW,
+                NW | SE   => CursorKind::ResizeNWSE,
+                NE | SW   => CursorKind::ResizeNESW,
+            };
+        }
+
+        // I-beam над текстовыми полями.
+        if self.point_in_text_field(x, y) {
+            return CursorKind::IBeam;
+        }
+
+        CursorKind::Arrow
+    }
+
+    /// Попадает ли точка в редактируемое текстовое поле активного окна.
+    fn point_in_text_field(&self, x: i32, y: i32) -> bool {
+        let idx = self.active;
+        if idx >= self.windows.len() { return false; }
+        let w = &self.windows[idx];
+        if w.minimized { return false; }
+        let wx = w.x.max(0) as usize;
+        let wy = w.y.max(0) as usize;
+        if x < w.x || y < w.y { return false; }
+        let rel_x = (x - w.x) as usize;
+        let rel_y = (y - w.y) as usize;
+        if rel_x >= w.w || rel_y >= w.h { return false; }
+        let _ = (wx, wy);
+
+        match &w.content {
+            App::Notepad { .. } => {
+                let pad = 14;
+                let field_y = TITLE_H + 6;
+                let field_h = w.h.saturating_sub(TITLE_H + pad + 8);
+                rel_x >= pad && rel_x < w.w.saturating_sub(pad)
+                    && rel_y >= field_y && rel_y < field_y + field_h
+            }
+            App::Todo { .. } => {
+                let pad = 16;
+                let field_y = TITLE_H + pad;
+                let field_w = w.w.saturating_sub(pad * 3 + 80);
+                rel_x >= pad && rel_x < pad + field_w
+                    && rel_y >= field_y && rel_y < field_y + crate::widgets::FIELD_H
+            }
+            _ => false,
+        }
     }
 }
