@@ -14,6 +14,15 @@ const LOW_MEM_LIMIT: u64 = 0x10_0000;
 
 pub const USER_PML4_INDEX: usize = 0;
 
+/// Бит 2 в PTE/PDE/PDPTE: USER_ACCESSIBLE.
+const PAGE_USER: u64 = 1 << 2;
+/// Бит 7 в PDE: 2 MiB huge page.
+const PDE_HUGE: u64 = 1 << 7;
+/// Маска физического адреса для 4 KiB фрейма.
+const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+/// Маска для 2 MiB huge page.
+const HUGE_ADDR_MASK: u64 = 0x000F_FFFF_FFE0_0000;
+
 pub static FRAME_ALLOCATOR: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
 pub static KERNEL_PML4_PHYS: AtomicU64 = AtomicU64::new(0);
 pub static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -34,10 +43,6 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
     &mut *page_table_ptr
 }
 
-/// Замапить фрейм в **текущее** адресное пространство (по CR3).
-///
-/// # Safety
-/// Вызывать с активным AS, куда нужно замапить. `virt` не должен быть уже замаплен.
 pub unsafe fn map_current_as(
     phys_offset: VirtAddr,
     virt: u64,
@@ -94,6 +99,11 @@ impl AddressSpace {
         OffsetPageTable::new(&mut *pml4_ptr, phys_offset)
     }
 
+    /// Освобождает user-ветку (PML4[USER_PML4_INDEX]) и сам PML4.
+    ///
+    /// # Safety
+    /// Вызывается только когда этот AS больше никем не используется.
+    /// Мы никогда не трогаем kernel-shared entries (проверяем USER_ACCESSIBLE).
     pub unsafe fn destroy(pml4_phys: u64) {
         let phys_offset = PHYS_OFFSET.load(Ordering::Acquire);
         if phys_offset == 0 {
@@ -107,12 +117,13 @@ impl AddressSpace {
         let pml4_virt = phys_offset + pml4_phys;
         let pml4 = pml4_virt as *const u64;
         let entry0 = *pml4.add(USER_PML4_INDEX);
-        if entry0 & 1 == 0 {
-            dealloc_frame(alloc, pml4_phys);
-            return;
+
+        // PML4[0] должен существовать и быть user-accessible.
+        if entry0 & 1 != 0 && entry0 & PAGE_USER != 0 {
+            let pdpt_phys = entry0 & ADDR_MASK;
+            free_pdpt(alloc, phys_offset, pdpt_phys);
         }
-        let pdpt_phys = entry0 & 0x000F_FFFF_FFFF_F000;
-        free_pdpt(alloc, phys_offset, pdpt_phys);
+        // В любом случае освобождаем саму PML4.
         dealloc_frame(alloc, pml4_phys);
     }
 }
@@ -121,8 +132,10 @@ unsafe fn free_pdpt(alloc: &mut BootInfoFrameAllocator, phys_offset: u64, pdpt_p
     let pdpt = (phys_offset + pdpt_phys) as *const u64;
     for i in 0..512 {
         let e = *pdpt.add(i);
-        if e & 1 == 0 { continue; }
-        let pd_phys = e & 0x000F_FFFF_FFFF_F000;
+        if e & 1 == 0 || e & PAGE_USER == 0 {
+            continue;
+        }
+        let pd_phys = e & ADDR_MASK;
         free_pd(alloc, phys_offset, pd_phys);
     }
     dealloc_frame(alloc, pdpt_phys);
@@ -132,13 +145,16 @@ unsafe fn free_pd(alloc: &mut BootInfoFrameAllocator, phys_offset: u64, pd_phys:
     let pd = (phys_offset + pd_phys) as *const u64;
     for i in 0..512 {
         let e = *pd.add(i);
-        if e & 1 == 0 { continue; }
-        if e & (1 << 7) != 0 {
-            let page_phys = e & 0x000F_FFFF_FFE0_0000;
+        if e & 1 == 0 || e & PAGE_USER == 0 {
+            continue;
+        }
+        if e & PDE_HUGE != 0 {
+            // 2 MiB huge page — освобождаем один фрейм.
+            let page_phys = e & HUGE_ADDR_MASK;
             dealloc_frame(alloc, page_phys);
             continue;
         }
-        let pt_phys = e & 0x000F_FFFF_FFFF_F000;
+        let pt_phys = e & ADDR_MASK;
         free_pt(alloc, phys_offset, pt_phys);
     }
     dealloc_frame(alloc, pd_phys);
@@ -148,8 +164,10 @@ unsafe fn free_pt(alloc: &mut BootInfoFrameAllocator, phys_offset: u64, pt_phys:
     let pt = (phys_offset + pt_phys) as *const u64;
     for i in 0..512 {
         let e = *pt.add(i);
-        if e & 1 == 0 { continue; }
-        let page_phys = e & 0x000F_FFFF_FFFF_F000;
+        if e & 1 == 0 || e & PAGE_USER == 0 {
+            continue;
+        }
+        let page_phys = e & ADDR_MASK;
         dealloc_frame(alloc, page_phys);
     }
     dealloc_frame(alloc, pt_phys);
@@ -157,9 +175,7 @@ unsafe fn free_pt(alloc: &mut BootInfoFrameAllocator, phys_offset: u64, pt_phys:
 
 unsafe fn dealloc_frame(alloc: &mut BootInfoFrameAllocator, phys: u64) {
     let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys));
-    unsafe {
-        FrameDeallocator::deallocate_frame(alloc, frame);
-    }
+    FrameDeallocator::deallocate_frame(alloc, frame);
 }
 
 pub struct BootInfoFrameAllocator {
@@ -194,7 +210,10 @@ impl BootInfoFrameAllocator {
         while self.next_region < count {
             let r = match self.memory_regions.iter().nth(self.next_region) {
                 Some(r) => r,
-                None => { self.next_region = count; return; }
+                None => {
+                    self.next_region = count;
+                    return;
+                }
             };
             if r.kind == MemoryRegionKind::Usable {
                 let start = r.start.max(LOW_MEM_LIMIT);

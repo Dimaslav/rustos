@@ -14,7 +14,6 @@ const FG: (u8, u8, u8) = (235, 240, 250);
 
 struct Calc {
     buf: *mut u8,
-    win_id: u64,
     display: u64,
     a: u64,
     op: char,
@@ -138,7 +137,6 @@ pub extern "C" fn _start() -> ! {
 
     let mut calc = Calc {
         buf: WIN_BUF_VADDR as *mut u8,
-        win_id,
         display: 0,
         a: 0,
         op: ' ',

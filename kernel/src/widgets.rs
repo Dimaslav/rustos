@@ -1,13 +1,11 @@
-use alloc::string::ToString;
 use crate::framebuffer::{Color, Writer, FONT_HEIGHT};
+use crate::gui::icons::{self, IconKind};
 use crate::gui::theme;
 
 pub const BUTTON_H: usize = 30;
 pub const FIELD_H: usize = 26;
 pub const ROW_H: usize = 20;
 
-// Устаревшие константы — оставлены для совместимости, но в новом коде
-// используй `theme::palette().*`.
 pub const ACCENT: Color = Color { r: 90, g: 140, b: 255 };
 pub const ACCENT_HOVER: Color = Color { r: 120, g: 165, b: 255 };
 pub const SURFACE: Color = Color { r: 240, g: 242, b: 248 };
@@ -18,7 +16,8 @@ pub const TEXT_LIGHT: Color = Color { r: 235, g: 238, b: 245 };
 pub const MUTED: Color = Color { r: 140, g: 145, b: 160 };
 pub const SHADOW: Color = Color { r: 0, g: 0, b: 0 };
 
-/// Современная кнопка с закруглением. Цвета передаёт caller.
+/// Кнопка с тенью. Цвета берутся из аргументов, а не из темы — caller
+/// сам решает, использовать ли accent, danger, window_bg_alt и т. д.
 pub fn button_modern(
     w: &mut Writer,
     x: usize,
@@ -39,7 +38,7 @@ pub fn button_modern(
     w.draw_text_at(tx, ty, label, fg, bg);
 }
 
-/// Текстовое поле в современном стиле.
+/// Поле ввода с рамкой и курсором в конце.
 pub fn text_field_modern(
     w: &mut Writer,
     x: usize,
@@ -79,7 +78,7 @@ pub fn text_field_modern(
     }
 }
 
-/// Список с подсветкой выбранной строки.
+/// Простой список с выделением и прокруткой (визуально — только видимые строки).
 pub fn list_box_modern(
     w: &mut Writer,
     x: usize,
@@ -108,13 +107,13 @@ pub fn list_box_modern(
     }
 }
 
-/// Иконка на рабочем столе — закруглённая плитка с буквой.
+/// Иконка + подпись + подсветка выделения. Всё в цветах `theme::palette()`.
 pub fn desktop_icon_modern(
     w: &mut Writer,
     x: usize,
     y: usize,
     label: &str,
-    icon_char: char,
+    icon_kind: IconKind,
     color: Color,
     selected: bool,
 ) {
@@ -123,11 +122,11 @@ pub fn desktop_icon_modern(
     w.fill_round_rect(x + 2, y + 3, size, size, 10, p.shadow);
     w.fill_round_rect(x, y, size, size, 10, color);
 
-    let cw = 9;
-    let ch = FONT_HEIGHT;
-    let cx = x + (size - cw) / 2;
-    let cy = y + (size - ch) / 2 - 2;
-    w.draw_text_at(cx, cy, &icon_char.to_string(), Color::WHITE, color);
+    // Иконка по центру квадрата 44×44, размер 28×28.
+    let icon_size = 28usize;
+    let icon_x = x + (size - icon_size) / 2;
+    let icon_y = y + (size - icon_size) / 2;
+    icons::draw(icon_kind, w, icon_x, icon_y, icon_size, Color::WHITE);
 
     let tw = Writer::text_width(label);
     let tx = x + (size.saturating_sub(tw)) / 2;

@@ -10,7 +10,7 @@ use x86_64::structures::idt::{
 };
 use x86_64::{PrivilegeLevel, VirtAddr};
 
-use crate::{println, serial_println};
+use crate::println;
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -84,15 +84,15 @@ pub fn init() {
 
         let m = Port::<u8>::new(0x21).read();
         let s = Port::<u8>::new(0xA1).read();
-        serial_println!(
+        crate::log_info!(
             "[pic] master mask = {:#010b}, slave mask = {:#010b}",
             m, s
         );
         if m & 0b100 != 0 {
-            serial_println!("[pic] !!! IRQ2 (cascade) замаскирован !!!");
+            crate::log_error!("[pic] IRQ2 (cascade) замаскирован — PS/2 мышь не будет работать");
         }
         if s & 0b0001_0000 != 0 {
-            serial_println!("[pic] !!! IRQ12 (mouse) замаскирован !!!");
+            crate::log_error!("[pic] IRQ12 (mouse) замаскирован — PS/2 мышь не будет работать");
         }
 
         crate::mouse::init();
@@ -102,8 +102,8 @@ pub fn init() {
 }
 
 extern "x86-interrupt" fn breakpoint_handler(sf: InterruptStackFrame) {
-    serial_println!("EXCEPTION: BREAKPOINT");
-    serial_println!("{:#?}", sf);
+    crate::log_warn!("EXCEPTION: BREAKPOINT");
+    crate::log_warn!("{:#?}", sf);
     println!("EXCEPTION: BREAKPOINT");
 }
 
@@ -111,8 +111,8 @@ extern "x86-interrupt" fn double_fault_handler(
     sf: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
-    serial_println!("EXCEPTION: DOUBLE FAULT");
-    serial_println!("{:#?}", sf);
+    crate::log_error!("EXCEPTION: DOUBLE FAULT");
+    crate::log_error!("{:#?}", sf);
     println!("EXCEPTION: DOUBLE FAULT");
     loop {
         unsafe { asm!("hlt"); }
@@ -129,14 +129,28 @@ extern "x86-interrupt" fn page_fault_handler(
     let user = error_code.contains(PageFaultErrorCode::USER_MODE);
     let instr = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
 
-    serial_println!("EXCEPTION: PAGE FAULT");
-    serial_println!("  addr:       {:?}", addr);
-    serial_println!("  protection: {}", protection);
-    serial_println!("  write:      {}", write);
-    serial_println!("  user:       {}", user);
-    serial_println!("  instr:      {}", instr);
-    serial_println!("{:#?}", sf);
+    crate::log_error!("EXCEPTION: PAGE FAULT");
+    crate::log_error!("  addr:       {:?}", addr);
+    crate::log_error!("  protection: {}", protection);
+    crate::log_error!("  write:      {}", write);
+    crate::log_error!("  user:       {}", user);
+    crate::log_error!("  instr:      {}", instr);
+    crate::log_error!("  rip:        {:?}", sf.instruction_pointer);
 
+    if user {
+        // User-поток упал. Убиваем его — kernel продолжает работу.
+        // Это изоляция: падение user-программы не вешает GUI.
+        crate::log_warn!("[fault] killing user thread");
+
+        // Восстанавливаем нормальный kernel CR3 (на случай, если fault
+        // произошёл в user-AS, и мы сейчас на user-таблицах).
+        // Scheduler сам подставит нужный CR3 при следующем switch.
+
+        crate::sched::exit_current();
+    }
+
+    // Kernel fault — аварийная остановка.
+    crate::log_error!("{:#?}", sf);
     println!(
         "EXCEPTION: PAGE FAULT addr={:?} w={} p={}",
         addr, write, protection
@@ -150,8 +164,8 @@ extern "x86-interrupt" fn gpf_handler(
     sf: InterruptStackFrame,
     error_code: u64,
 ) {
-    serial_println!("EXCEPTION: GENERAL PROTECTION FAULT (code={})", error_code);
-    serial_println!("{:#?}", sf);
+    crate::log_error!("EXCEPTION: GENERAL PROTECTION FAULT (code={})", error_code);
+    crate::log_error!("{:#?}", sf);
     println!(
         "EXCEPTION: GENERAL PROTECTION FAULT (code={})",
         error_code

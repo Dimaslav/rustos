@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,36 +42,72 @@ impl RingBuffer {
     }
 }
 
+/// Одна зажатая клавиша. Нужна для автоповтора в `task::repeat`.
+struct HeldKey {
+    /// Сканкод без release-бита (0x00..0x7F).
+    scancode: u8,
+    /// Был ли префикс 0xE0.
+    is_ext: bool,
+    key: Key,
+    start_tick: u64,
+}
+
 static MODS: Mutex<(bool, bool, bool)> = Mutex::new((false, false, false));
 static EXTENDED: Mutex<bool> = Mutex::new(false);
 static KEYS: Mutex<RingBuffer> = Mutex::new(RingBuffer::new());
+/// Набор зажатых клавиш (а не одна) — иначе отпускание одной сбрасывало бы
+/// автоповтор для другой.
+static HELD: Mutex<Vec<HeldKey>> = Mutex::new(Vec::new());
 
-/// Клавиша, которая сейчас удерживается (для автоповтора).
-/// Хранится вместе с tick'ом, когда началось удержание.
-static HELD: Mutex<Option<(Key, u64)>> = Mutex::new(None);
+/// Если `true`, GUI не забирает клавиатуру — ею владеет user-shell.
+static USER_OWNS: AtomicBool = AtomicBool::new(false);
 
 pub fn modifiers() -> (bool, bool, bool) { *MODS.lock() }
 pub fn pop() -> Option<Key> { KEYS.lock().pop() }
 
-/// Текущая удерживаемая клавиша и tick начала удержания.
+/// Первая (самая старая) зажатая клавиша — именно она повторяется.
 pub fn held() -> Option<(Key, u64)> {
-    *HELD.lock()
+    let h = HELD.lock();
+    h.first().map(|e| (e.key, e.start_tick))
 }
 
-/// Принудительно положить клавишу в очередь (для autorepeat).
-pub fn push_key(k: Key) {
-    KEYS.lock().push(k);
+pub fn push_key(k: Key) { KEYS.lock().push(k); }
+
+pub fn set_user_owns(v: bool) { USER_OWNS.store(v, Ordering::Release); }
+pub fn user_owns() -> bool { USER_OWNS.load(Ordering::Acquire) }
+
+/// Сбросить состояние зажатых клавиш (например, при потере фокуса).
+pub fn clear_held() {
+    HELD.lock().clear();
 }
 
-/// Очистить состояние удержания (при release).
-fn clear_held() {
-    *HELD.lock() = None;
-}
-
-/// Установить удерживаемую клавишу.
-fn set_held(k: Key) {
+fn add_held(scancode: u8, is_ext: bool, key: Key) {
     let now = crate::interrupts::ticks();
-    *HELD.lock() = Some((k, now));
+    let mut h = HELD.lock();
+    // Убираем старую запись для того же физического ключа (на всякий случай),
+    // затем добавляем свежую.
+    h.retain(|e| !(e.scancode == scancode && e.is_ext == is_ext));
+    h.push(HeldKey { scancode, is_ext, key, start_tick: now });
+}
+
+fn remove_held(scancode: u8, is_ext: bool) {
+    HELD.lock().retain(|e| !(e.scancode == scancode && e.is_ext == is_ext));
+}
+
+/// Достать «печатный» символ из очереди:
+/// `Enter` → `'\n'`, `Backspace` → `0x08`, `Tab` → `'\t'`.
+/// Всё остальное (стрелки, F-клавиши, Escape) пропускается.
+pub fn pop_char() -> Option<u8> {
+    loop {
+        let k = pop()?;
+        match k {
+            Key::Char(c) => return Some(c),
+            Key::Enter => return Some(b'\n'),
+            Key::Backspace => return Some(0x08),
+            Key::Tab => return Some(b'\t'),
+            _ => continue,
+        }
+    }
 }
 
 pub fn scancode_to_ascii(sc: u8, shift: bool) -> Option<u8> {
@@ -130,67 +167,80 @@ pub fn scancode_to_ascii(sc: u8, shift: bool) -> Option<u8> {
     Some(c)
 }
 
+/// Специальные (непечатные) клавиши. `is_ext` важен: без префикса 0xE0
+/// коды 0x48/0x50/... означают цифры на numpad, а не стрелки.
+fn decode_special(code: u8, is_ext: bool) -> Option<Key> {
+    Some(match code {
+        0x01 => Key::Escape,
+        0x0E => Key::Backspace,
+        0x0F => Key::Tab,
+        0x1C => Key::Enter,
+        0x48 if is_ext => Key::Up,
+        0x50 if is_ext => Key::Down,
+        0x4B if is_ext => Key::Left,
+        0x4D if is_ext => Key::Right,
+        0x47 if is_ext => Key::Home,
+        0x4F if is_ext => Key::End,
+        0x53 if is_ext => Key::Delete,
+        0x49 if is_ext => Key::PageUp,
+        0x51 if is_ext => Key::PageDown,
+        0x3B..=0x44 => Key::F(code - 0x3B + 1),
+        0x57 => Key::F(11),
+        0x58 => Key::F(12),
+        _ => return None,
+    })
+}
+
 pub fn handle(sc: u8) {
-    {
-        let mut ext = EXTENDED.lock();
-        if sc == 0xE0 { *ext = true; return; }
-        if sc == 0xE1 { *ext = false; return; }
-    }
-    let is_ext = { let mut e = EXTENDED.lock(); let v = *e; *e = false; v };
+    // 1. Разбираемся с префиксом 0xE0.
+    let is_ext = {
+        let mut e = EXTENDED.lock();
+        if sc == 0xE0 {
+            *e = true;
+            return;
+        }
+        if sc == 0xE1 {
+            // Pause/Break — много-байтовая последовательность, пропускаем.
+            *e = false;
+            return;
+        }
+        let v = *e;
+        *e = false;
+        v
+    };
 
     let release = sc & 0x80 != 0;
     let code = sc & 0x7F;
 
+    // 2. Модификаторы — не участвуют в автоповторе.
     match code {
-        0x2A | 0x36 => { MODS.lock().0 = !release; return; }
-        0x1D => { MODS.lock().1 = !release; return; }
-        0x38 => { MODS.lock().2 = !release; return; }
+        0x2A | 0x36 => { MODS.lock().0 = !release; return; } // Shift
+        0x1D => { MODS.lock().1 = !release; return; }        // Ctrl
+        0x38 => { MODS.lock().2 = !release; return; }        // Alt
         _ => {}
     }
 
+    // 3. Release — убираем конкретный физический ключ из набора зажатых.
     if release {
-        clear_held();
+        remove_held(code, is_ext);
         return;
     }
 
-    let key = match code {
-        0x01 => Some(Key::Escape),
-        0x0E => Some(Key::Backspace),
-        0x0F => Some(Key::Tab),
-        0x1C => Some(Key::Enter),
-        0x48 if is_ext => Some(Key::Up),
-        0x50 if is_ext => Some(Key::Down),
-        0x4B if is_ext => Some(Key::Left),
-        0x4D if is_ext => Some(Key::Right),
-        0x47 if is_ext => Some(Key::Home),
-        0x4F if is_ext => Some(Key::End),
-        0x53 if is_ext => Some(Key::Delete),
-        0x49 if is_ext => Some(Key::PageUp),
-        0x51 if is_ext => Some(Key::PageDown),
-        0x3B..=0x44 => Some(Key::F((code - 0x3B + 1) as u8)),
-        0x57 => Some(Key::F(11)),
-        0x58 => Some(Key::F(12)),
-        _ => None,
-    };
-    if let Some(k) = key {
+    // 4. Специальная клавиша?
+    if let Some(k) = decode_special(code, is_ext) {
         KEYS.lock().push(k);
-        // Запоминаем для автоповтора (кроме Escape и F-клавиш — их не повторяем).
+        // Escape и F-клавиши не повторяются.
         if !matches!(k, Key::Escape | Key::F(_)) {
-            set_held(k);
-        } else {
-            clear_held();
+            add_held(code, is_ext, k);
         }
         return;
     }
 
+    // 5. Обычный символ.
     let shift = MODS.lock().0;
     if let Some(c) = scancode_to_ascii(code, shift) {
         let k = Key::Char(c);
         KEYS.lock().push(k);
-        set_held(k);
+        add_held(code, is_ext, k);
     }
 }
-
-/// Служебное: убирает неиспользуемый импорт если включим сборку без autorepeat.
-#[allow(dead_code)]
-fn _use_vec() { let _: Vec<u8> = Vec::new(); }

@@ -1,5 +1,9 @@
 //! Минимальная реализация FAT32: монтирование, листинг каталогов,
 //! чтение и запись файлов, создание/удаление каталогов.
+//!
+//! Поддерживается чтение и запись Long File Names (LFN):
+//! длинные имена и кириллица сохраняются как LFN-записи (UTF-16),
+//! рядом создаётся synthetic SHORT 8.3 с суффиксом `~N`.
 
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -20,8 +24,12 @@ pub struct FatEntry {
     pub kind: FatKind,
     pub size: u32,
     pub first_cluster: u32,
+    /// LBA сектора, где начинается short-entry.
     pub dir_offset: u32,
+    /// Смещение внутри сектора для short-entry.
     pub entry_off: usize,
+    /// Сколько LFN-записей стоит **перед** short-entry (0 — только short).
+    pub lfn_count: usize,
 }
 
 #[derive(Debug)]
@@ -89,8 +97,6 @@ impl Fat32 {
             fs_info_sector,
         })
     }
-
-    // ---------- Публичные геттеры ----------
 
     pub fn root_cluster(&self) -> u32 {
         self.root_cluster
@@ -374,6 +380,7 @@ impl Fat32 {
             let cl_lo = u16::from_le_bytes([e[26], e[27]]) as u32;
             let first_cluster = (cl_hi << 16) | cl_lo;
 
+            let lfn_count = lfn_parts.len();
             let name = if lfn_parts.is_empty() {
                 short
             } else {
@@ -383,11 +390,7 @@ impl Fat32 {
                     s.push_str(p);
                 }
                 lfn_parts.clear();
-                if s.is_empty() {
-                    short
-                } else {
-                    s
-                }
+                if s.is_empty() { short } else { s }
             };
 
             out.push(FatEntry {
@@ -397,18 +400,15 @@ impl Fat32 {
                 first_cluster,
                 dir_offset: 0,
                 entry_off: 0,
+                lfn_count,
             });
         }
         out
     }
 
-    /// Проставляет `dir_offset` (LBA сектора) и `entry_off` (смещение внутри сектора)
-    /// для каждой записи, сканируя каталог повторно.
     fn annotate_positions(&mut self, start_cluster: u32, entries: &mut [FatEntry]) {
         let raw = self.read_chain(start_cluster, None);
 
-        // Карта: индекс байта в raw → (LBA, offset внутри сектора).
-        // Проходим по цепочке кластеров и собираем LBA для каждого сектора.
         let spc = self.sectors_per_cluster as u32;
         let mut sector_lbas: Vec<u32> = Vec::new();
         let mut c = start_cluster;
@@ -451,7 +451,6 @@ impl Fat32 {
                 continue;
             }
 
-            // Реальная запись находится на `i - lfn_count*32`.
             let real_off = i - lfn_count * 32;
             let sector_in_chain = real_off / SECTOR_SIZE;
             let off_in_sector = real_off % SECTOR_SIZE;
@@ -460,6 +459,7 @@ impl Fat32 {
                 if let Some(&lba) = sector_lbas.get(sector_in_chain) {
                     entries[entry_idx].dir_offset = lba;
                     entries[entry_idx].entry_off = off_in_sector;
+                    entries[entry_idx].lfn_count = lfn_count;
                 }
             }
 
@@ -479,33 +479,94 @@ impl Fat32 {
             return Err(FatError::AlreadyExists);
         }
 
-        let (lba, off) = self.find_free_dir_slot(dir_cluster)?;
-        let mut sector = self.drive.read_sector(lba).ok_or(FatError::Io)?;
+        let (short_name, lfn_entries) = self.build_short_and_lfn(dir_cluster, name)?;
+        let total_slots = lfn_entries.len() + 1;
 
-        let (base, ext) = to_short_name(name);
-        let mut e = [0u8; 32];
-        e[0..8].copy_from_slice(&base);
-        e[8..11].copy_from_slice(&ext);
-        e[11] = ATTR_ARCHIVE;
+        let (start_lba, start_off, _cross) =
+            self.find_free_dir_slots(dir_cluster, total_slots)?;
 
-        for i in 0..32 {
-            sector[off + i] = e[i];
+        let mut all_entries: Vec<[u8; 32]> = Vec::with_capacity(total_slots);
+        for lfn in &lfn_entries {
+            all_entries.push(*lfn);
         }
-        if !self.drive.write_sector(lba, &sector) {
-            return Err(FatError::Io);
-        }
+        let mut short_entry = [0u8; 32];
+        short_entry.copy_from_slice(&short_name);
+        short_entry[11] = ATTR_ARCHIVE;
+        all_entries.push(short_entry);
+
+        self.write_dir_entries(dir_cluster, start_lba, start_off, &all_entries)?;
 
         Ok(FatEntry {
             name: name.to_string(),
             kind: FatKind::File,
             size: 0,
             first_cluster: 0,
-            dir_offset: lba,
-            entry_off: off,
+            dir_offset: start_lba,
+            entry_off: start_off + lfn_entries.len() * 32,
+            lfn_count: lfn_entries.len(),
         })
     }
 
-    fn find_free_dir_slot(&mut self, dir_cluster: u32) -> FatResult<(u32, usize)> {
+    /// Записать массив 32-байтовых записей подряд в каталог, начиная с
+    /// `(start_lba, start_off)`. Может переходить в следующий сектор кластера.
+    fn write_dir_entries(
+        &mut self,
+        dir_cluster: u32,
+        start_lba: u32,
+        start_off: usize,
+        entries: &[[u8; 32]],
+    ) -> FatResult<()> {
+        let spc = self.sectors_per_cluster as u32;
+        let mut cluster = dir_cluster;
+        let mut chain_lbas: Vec<u32> = Vec::new();
+        let mut guard = 0u32;
+        while cluster >= 2 && cluster < 0x0FFF_FFF8 && guard < 1_000_000 {
+            guard += 1;
+            let lba0 = self.cluster_to_lba(cluster);
+            for s in 0..spc {
+                chain_lbas.push(lba0 + s);
+            }
+            let next = self.fat_next(cluster);
+            if next == cluster || next >= 0x0FFF_FFF8 {
+                break;
+            }
+            cluster = next;
+        }
+
+        let mut idx = match chain_lbas.iter().position(|&l| l == start_lba) {
+            Some(i) => i,
+            None => return Err(FatError::Io),
+        };
+        let mut off = start_off;
+
+        for entry in entries {
+            let mut sector = self.drive.read_sector(chain_lbas[idx]).ok_or(FatError::Io)?;
+            for k in 0..32 {
+                sector[off + k] = entry[k];
+            }
+            self.drive.write_sector(chain_lbas[idx], &sector);
+
+            off += 32;
+            if off + 32 > SECTOR_SIZE {
+                off = 0;
+                idx += 1;
+                if idx >= chain_lbas.len() {
+                    return Err(FatError::NoSpace);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Найти место под `n` подряд идущих 32-байтовых слотов в каталоге.
+    /// Возвращает `(lba, offset)` первого слота. `write_dir_entries` сам
+    /// справится с переходом между секторами.
+    fn find_free_dir_slots(
+        &mut self,
+        dir_cluster: u32,
+        n: usize,
+    ) -> FatResult<(u32, usize, Option<(u32, usize)>)> {
         let csize = self.cluster_size_bytes() as usize;
         let entries_per_cluster = csize / 32;
         let mut cluster = dir_cluster;
@@ -514,6 +575,9 @@ impl Fat32 {
         while cluster >= 2 && cluster < 0x0FFF_FFF8 && guard < 1_000_000 {
             guard += 1;
             let lba = self.cluster_to_lba(cluster);
+
+            let mut run_start: Option<usize> = None;
+            let mut run_len = 0usize;
             for k in 0..entries_per_cluster {
                 let off_in_cluster = k * 32;
                 let sector_idx = off_in_cluster / SECTOR_SIZE;
@@ -521,11 +585,25 @@ impl Fat32 {
                 let abs_lba = lba + sector_idx as u32;
                 let sector = self.drive.read_sector(abs_lba).ok_or(FatError::Io)?;
                 let first = sector[off_in_sector];
+
                 if first == 0x00 || first == 0xE5 {
-                    return Ok((abs_lba, off_in_sector));
+                    if run_start.is_none() {
+                        run_start = Some(k);
+                    }
+                    run_len += 1;
+                    if run_len >= n {
+                        let s = run_start.unwrap();
+                        let abs_off_in_cluster = s * 32;
+                        let start_sector = lba + (abs_off_in_cluster / SECTOR_SIZE) as u32;
+                        let start_off = abs_off_in_cluster % SECTOR_SIZE;
+                        return Ok((start_sector, start_off, None));
+                    }
+                } else {
+                    run_start = None;
+                    run_len = 0;
                 }
             }
-            // Здесь `cluster` — последний посещённый.
+
             let next = self.fat_next(cluster);
             if next == cluster || next >= 0x0FFF_FFF8 {
                 // Расширяем каталог на один кластер.
@@ -534,11 +612,123 @@ impl Fat32 {
                 self.write_cluster(new_c, &zeros);
                 self.fat_set(cluster, new_c);
                 let lba = self.cluster_to_lba(new_c);
-                return Ok((lba, 0));
+                return Ok((lba, 0, None));
             }
             cluster = next;
         }
         Err(FatError::NoSpace)
+    }
+
+    /// Сгенерировать SHORT 8.3 имя + массив LFN-записей для `name`.
+    /// Возвращает `(short_11_bytes_padded_to_32, lfn_entries_в_порядке_записи)`.
+    fn build_short_and_lfn(
+        &mut self,
+        dir_cluster: u32,
+        name: &str,
+    ) -> FatResult<([u8; 32], Vec<[u8; 32]>)> {
+        let plain = plain_8_3(name);
+        let (short11, need_lfn) = match plain {
+            Some(bytes) => (bytes, false),
+            None => (self.synthetic_short(dir_cluster, name)?, true),
+        };
+
+        let mut short_entry = [0u8; 32];
+        short_entry[0..11].copy_from_slice(&short11);
+
+        let lfn_entries = if need_lfn {
+            make_lfn_entries(&short11, name)
+        } else {
+            Vec::new()
+        };
+
+        Ok((short_entry, lfn_entries))
+    }
+
+    /// Сгенерировать synthetic SHORT 8.3 имя для длинного имени,
+    /// избегая коллизий в каталоге.
+    fn synthetic_short(
+        &mut self,
+        dir_cluster: u32,
+        name: &str,
+    ) -> FatResult<[u8; 11]> {
+        let mut prefix: Vec<u8> = Vec::new();
+        for c in name.chars() {
+            if prefix.len() >= 6 {
+                break;
+            }
+            if c.is_ascii_alphanumeric() {
+                prefix.push(c.to_ascii_uppercase() as u8);
+            }
+        }
+        if prefix.is_empty() {
+            prefix.push(b'F');
+        }
+
+        let ext: [u8; 3] = if let Some(dot) = name.rfind('.') {
+            let e = &name[dot + 1..];
+            let mut arr = [b' '; 3];
+            let mut n = 0;
+            for c in e.chars().take(3) {
+                if c.is_ascii_alphanumeric() {
+                    arr[n] = c.to_ascii_uppercase() as u8;
+                    n += 1;
+                }
+            }
+            arr
+        } else {
+            [b' '; 3]
+        };
+
+        for i in 1..=99u32 {
+            let tail = format!("~{}", i);
+            let tail_b = tail.as_bytes();
+            let mut base = [b' '; 8];
+
+            let keep = 8 - tail_b.len();
+            let take = prefix.len().min(keep);
+            for k in 0..take {
+                base[k] = prefix[k];
+            }
+            for k in 0..tail_b.len() {
+                base[take + k] = tail_b[k];
+            }
+
+            let mut full = [b' '; 11];
+            full[0..8].copy_from_slice(&base);
+            full[8..11].copy_from_slice(&ext);
+
+            if self.find_in_dir_short(dir_cluster, &full).is_none() {
+                return Ok(full);
+            }
+        }
+
+        Err(FatError::NoSpace)
+    }
+
+    /// Найти запись по 11-байтовому короткому имени (без LFN).
+    fn find_in_dir_short(&mut self, dir_cluster: u32, short11: &[u8; 11]) -> Option<FatEntry> {
+        let raw = self.read_chain(dir_cluster, None);
+        let mut i = 0usize;
+        while i + 32 <= raw.len() {
+            let e = &raw[i..i + 32];
+            i += 32;
+            if e[0] == 0x00 { break; }
+            if e[0] == 0xE5 { continue; }
+            if e[11] == ATTR_LFN { continue; }
+            if e[11] & ATTR_VOLUME_ID != 0 { continue; }
+            if &e[0..11] == short11 {
+                return Some(FatEntry {
+                    name: String::new(),
+                    kind: FatKind::File,
+                    size: 0,
+                    first_cluster: 0,
+                    dir_offset: 0,
+                    entry_off: 0,
+                    lfn_count: 0,
+                });
+            }
+        }
+        None
     }
 
     // ---------- Запись файла ----------
@@ -611,29 +801,18 @@ impl Fat32 {
 
     pub fn remove(&mut self, entry: &FatEntry) -> FatResult<()> {
         if entry.kind == FatKind::Directory {
-            // Проверяем, что каталог пуст.
             let raw = self.read_chain(entry.first_cluster, None);
             let mut i = 0usize;
             let mut has_content = false;
             while i + 32 <= raw.len() {
                 let e = &raw[i..i + 32];
                 i += 32;
-                if e[0] == 0x00 {
-                    break;
-                }
-                if e[0] == 0xE5 {
-                    continue;
-                }
+                if e[0] == 0x00 { break; }
+                if e[0] == 0xE5 { continue; }
                 let attr = e[11];
-                if attr == ATTR_LFN {
-                    continue;
-                }
-                if attr & ATTR_VOLUME_ID != 0 {
-                    continue;
-                }
-                if e[0] == b'.' {
-                    continue;
-                }
+                if attr == ATTR_LFN { continue; }
+                if attr & ATTR_VOLUME_ID != 0 { continue; }
+                if e[0] == b'.' { continue; }
                 has_content = true;
                 break;
             }
@@ -646,37 +825,137 @@ impl Fat32 {
             self.free_chain(entry.first_cluster);
         }
 
-        // Помечаем запись удалённой.
-        let lba = entry.dir_offset;
-        let off = entry.entry_off;
-        let mut sector = self.drive.read_sector(lba).ok_or(FatError::Io)?;
-        sector[off] = 0xE5;
-        if !self.drive.write_sector(lba, &sector) {
-            return Err(FatError::Io);
+        let total = entry.lfn_count + 1;
+        self.mark_dir_entries_deleted(
+            entry.dir_offset,
+            entry.entry_off,
+            entry.lfn_count,
+            total,
+        )?;
+        Ok(())
+    }
+
+    /// Помечает `total` записей как удалённые (0xE5), начиная с записи
+    /// `(lba, off)`, идя назад на `back` записей.
+    fn mark_dir_entries_deleted(
+        &mut self,
+        lba: u32,
+        off: usize,
+        back: usize,
+        total: usize,
+    ) -> FatResult<()> {
+        let mut cur_lba = lba;
+        let mut cur_off = off;
+
+        for _ in 0..back {
+            if cur_off >= 32 {
+                cur_off -= 32;
+            } else {
+                if cur_lba == 0 {
+                    return Err(FatError::Io);
+                }
+                cur_lba -= 1;
+                cur_off = SECTOR_SIZE - 32;
+            }
+        }
+
+        for _ in 0..total {
+            let mut sector = self.drive.read_sector(cur_lba).ok_or(FatError::Io)?;
+            sector[cur_off] = 0xE5;
+            self.drive.write_sector(cur_lba, &sector);
+
+            cur_off += 32;
+            if cur_off >= SECTOR_SIZE {
+                cur_off = 0;
+                cur_lba += 1;
+            }
         }
         Ok(())
     }
 
     // ---------- Переименование ----------
 
+    /// Переименовать `entry` в `new_name`.
+    ///
+    /// Порядок операций выбран так, чтобы при любой ошибке (нет места, I/O)
+    /// исходная запись осталась целой:
+    ///   1. сохранить метаданные старой записи (attr, first_cluster, size);
+    ///   2. построить новые LFN + short;
+    ///   3. найти свободные слоты, **не трогая** старую запись;
+    ///   4. записать новые записи;
+    ///   5. только после успеха — пометить старые как удалённые.
+    ///
+    /// Если между (4) и (5) произойдёт сбой питания, в каталоге окажутся две
+    /// записи с одинаковыми данными. Это не потеря файла — лишнюю можно
+    /// удалить вручную.
+    ///
+    /// Ограничение MVP: поиск коллизий и свободных слотов идёт в корне.
     pub fn rename(&mut self, entry: &FatEntry, new_name: &str) -> FatResult<()> {
         if !valid_name(new_name) {
             return Err(FatError::InvalidName);
         }
 
-        let lba = entry.dir_offset;
-        let off = entry.entry_off;
-        let mut sector = self.drive.read_sector(lba).ok_or(FatError::Io)?;
-        let (base, ext) = to_short_name(new_name);
-        for i in 0..8 {
-            sector[off + i] = base[i];
+        if entry.name != new_name
+            && self.find_in_dir(self.root_cluster, new_name).is_some()
+        {
+            return Err(FatError::AlreadyExists);
         }
-        for i in 0..3 {
-            sector[off + 8 + i] = ext[i];
-        }
-        if !self.drive.write_sector(lba, &sector) {
+
+        // 1. Сохраняем метаданные старой записи.
+        let old_lba = entry.dir_offset;
+        let old_off = entry.entry_off;
+        let old_lfn_count = entry.lfn_count;
+        let first_cluster = entry.first_cluster;
+        let size = entry.size;
+
+        let old_sector = self.drive.read_sector(old_lba).ok_or(FatError::Io)?;
+        if old_off + 32 > old_sector.len() {
             return Err(FatError::Io);
         }
+        let attr = old_sector[old_off + 11];
+
+        // 2. Строим новое имя.
+        let dir_cluster = self.root_cluster;
+        let (short_entry_template, lfn_entries) =
+            self.build_short_and_lfn(dir_cluster, new_name)?;
+        let total_new = lfn_entries.len() + 1;
+
+        // 3. Ищем свободные слоты, НЕ трогая старую запись.
+        let (new_lba, new_off, _cross) =
+            self.find_free_dir_slots(dir_cluster, total_new)?;
+
+        // 4. Заполняем short-entry, сохраняя attr/cluster/size.
+        let mut short_entry = short_entry_template;
+        short_entry[11] = attr;
+        let cl_lo = (first_cluster & 0xFFFF) as u16;
+        let cl_hi = ((first_cluster >> 16) & 0xFFFF) as u16;
+        short_entry[20] = (cl_hi & 0xFF) as u8;
+        short_entry[21] = (cl_hi >> 8) as u8;
+        short_entry[26] = (cl_lo & 0xFF) as u8;
+        short_entry[27] = (cl_lo >> 8) as u8;
+        let sz = size.to_le_bytes();
+        short_entry[28] = sz[0];
+        short_entry[29] = sz[1];
+        short_entry[30] = sz[2];
+        short_entry[31] = sz[3];
+
+        let mut all_entries: Vec<[u8; 32]> = Vec::with_capacity(total_new);
+        for lfn in &lfn_entries {
+            all_entries.push(*lfn);
+        }
+        all_entries.push(short_entry);
+
+        // Пишем новые записи.
+        self.write_dir_entries(dir_cluster, new_lba, new_off, &all_entries)?;
+
+        // 5. Только теперь удаляем старые.
+        self.mark_dir_entries_deleted(
+            old_lba,
+            old_off,
+            old_lfn_count,
+            old_lfn_count + 1,
+        )?;
+
         Ok(())
     }
 
@@ -697,36 +976,38 @@ impl Fat32 {
         self.write_cluster(new_c, &buf);
         self.fat_set(new_c, FAT_EOC);
 
-        let (lba, off) = self.find_free_dir_slot(parent_cluster)?;
-        let mut sector = self.drive.read_sector(lba).ok_or(FatError::Io)?;
+        let (short_entry, lfn_entries) =
+            self.build_short_and_lfn(parent_cluster, name)?;
+        let total_slots = lfn_entries.len() + 1;
 
-        let (base, ext) = to_short_name(name);
-        let mut e = [0u8; 32];
-        e[0..8].copy_from_slice(&base);
-        e[8..11].copy_from_slice(&ext);
-        e[11] = ATTR_DIRECTORY;
+        let (start_lba, start_off, _cross) =
+            self.find_free_dir_slots(parent_cluster, total_slots)?;
 
+        let mut short_entry = short_entry;
+        short_entry[11] = ATTR_DIRECTORY;
         let lo = (new_c & 0xFFFF) as u16;
         let hi = ((new_c >> 16) & 0xFFFF) as u16;
-        e[20] = (hi & 0xFF) as u8;
-        e[21] = (hi >> 8) as u8;
-        e[26] = (lo & 0xFF) as u8;
-        e[27] = (lo >> 8) as u8;
+        short_entry[20] = (hi & 0xFF) as u8;
+        short_entry[21] = (hi >> 8) as u8;
+        short_entry[26] = (lo & 0xFF) as u8;
+        short_entry[27] = (lo >> 8) as u8;
 
-        for i in 0..32 {
-            sector[off + i] = e[i];
+        let mut all_entries: Vec<[u8; 32]> = Vec::with_capacity(total_slots);
+        for lfn in &lfn_entries {
+            all_entries.push(*lfn);
         }
-        if !self.drive.write_sector(lba, &sector) {
-            return Err(FatError::Io);
-        }
+        all_entries.push(short_entry);
+
+        self.write_dir_entries(parent_cluster, start_lba, start_off, &all_entries)?;
 
         Ok(FatEntry {
             name: name.to_string(),
             kind: FatKind::Directory,
             size: 0,
             first_cluster: new_c,
-            dir_offset: lba,
-            entry_off: off,
+            dir_offset: start_lba,
+            entry_off: start_off + lfn_entries.len() * 32,
+            lfn_count: lfn_entries.len(),
         })
     }
 
@@ -738,7 +1019,7 @@ impl Fat32 {
     }
 }
 
-// ---------- Утилиты ----------
+// ---------- Утилиты имён ----------
 
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -746,45 +1027,105 @@ fn valid_name(name: &str) -> bool {
         && !name.contains('\\')
         && name != "."
         && name != ".."
-        && name.len() <= 12
+        && name.len() <= 255
 }
 
-fn to_short_name(name: &str) -> ([u8; 8], [u8; 3]) {
-    let mut base = [b' '; 8];
-    let mut ext = [b' '; 3];
-    let (stem, extension) = match name.rfind('.') {
-        Some(i) if i > 0 => (&name[..i], &name[i + 1..]),
+/// Возвращает `Some(short_11)`, если имя помещается в plain 8.3 без потерь.
+fn plain_8_3(name: &str) -> Option<[u8; 11]> {
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 && i < name.len() - 1 => (&name[..i], &name[i + 1..]),
+        Some(i) if i > 0 => (&name[..i], ""),
         _ => (name, ""),
     };
+
+    if stem.is_empty() || stem.len() > 8 || ext.len() > 3 {
+        return None;
+    }
+    for c in stem.chars().chain(ext.chars()) {
+        if !c.is_ascii() { return None; }
+        let u = c as u8;
+        let ok = u.is_ascii_alphanumeric()
+            || u == b'_'
+            || u == b'-';
+        if !ok { return None; }
+    }
+
+    let mut out = [b' '; 11];
     for (i, b) in stem.bytes().take(8).enumerate() {
-        base[i] = b.to_ascii_uppercase();
+        out[i] = b.to_ascii_uppercase();
     }
-    for (i, b) in extension.bytes().take(3).enumerate() {
-        ext[i] = b.to_ascii_uppercase();
+    for (i, b) in ext.bytes().take(3).enumerate() {
+        out[8 + i] = b.to_ascii_uppercase();
     }
-    (base, ext)
+    Some(out)
 }
 
 fn parse_short_name(raw: &[u8]) -> String {
     let mut name = String::new();
     for &b in &raw[0..8] {
-        if b == b' ' || b == 0 {
-            break;
-        }
+        if b == b' ' || b == 0 { break; }
         name.push((b as char).to_ascii_uppercase());
     }
     let mut ext = String::new();
     for &b in &raw[8..11] {
-        if b == b' ' || b == 0 {
-            break;
-        }
+        if b == b' ' || b == 0 { break; }
         ext.push((b as char).to_ascii_lowercase());
     }
-    if ext.is_empty() {
-        name
-    } else {
-        format!("{}.{}", name, ext)
+    if ext.is_empty() { name } else { format!("{}.{}", name, ext) }
+}
+
+/// LFN checksum от 11-байтового short name.
+fn lfn_checksum(short11: &[u8; 11]) -> u8 {
+    let mut sum: u8 = 0;
+    for &b in short11.iter() {
+        sum = ((sum & 1) << 7).wrapping_add(sum >> 1).wrapping_add(b);
     }
+    sum
+}
+
+/// Собрать LFN-записи для длинного имени. Возвращает в порядке записи
+/// на диск: `[ord N | 0x40], [ord N-1], ..., [ord 1]`.
+fn make_lfn_entries(short11: &[u8; 11], long: &str) -> Vec<[u8; 32]> {
+    let mut utf16: Vec<u16> = long.encode_utf16().collect();
+    utf16.push(0); // terminator
+
+    let mut chunks: Vec<[u16; 13]> = Vec::new();
+    let mut idx = 0;
+    while idx < utf16.len() {
+        let mut c = [0xFFFFu16; 13];
+        for k in 0..13 {
+            if idx + k < utf16.len() {
+                c[k] = utf16[idx + k];
+            }
+        }
+        chunks.push(c);
+        idx += 13;
+    }
+
+    let checksum = lfn_checksum(short11);
+    let total = chunks.len();
+
+    let offsets = [
+        1usize, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30,
+    ];
+
+    let mut result: Vec<[u8; 32]> = Vec::with_capacity(total);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let ord = (total - i) as u8;
+        let is_last = i == 0;
+        let mut e = [0u8; 32];
+        e[0] = if is_last { ord | 0x40 } else { ord };
+        e[11] = ATTR_LFN;
+        e[12] = 0;
+        e[13] = checksum;
+        for (k, &off) in offsets.iter().enumerate() {
+            let c = chunk[k];
+            e[off] = (c & 0xFF) as u8;
+            e[off + 1] = ((c >> 8) & 0xFF) as u8;
+        }
+        result.push(e);
+    }
+    result
 }
 
 fn write_dot_entries(buf: &mut [u8], self_cluster: u32, parent_cluster: u32) {

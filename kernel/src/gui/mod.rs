@@ -1,7 +1,9 @@
 //! Оконный менеджер: состояние, диспетчер, оконный менеджмент.
 
+pub mod anim;
 pub mod chrome;
 pub mod draw;
+pub mod icons;
 pub mod input;
 pub mod notepad;
 pub mod state;
@@ -19,7 +21,12 @@ use crate::keyboard;
 use crate::mouse::{self, MouseButton, MouseEvent};
 use crate::sound;
 
-/// Оконный менеджер.
+pub struct WallpaperBuf {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<u8>,
+}
+
 pub struct Wm {
     pub(in crate::gui) windows: Vec<Window>,
     pub(in crate::gui) active: usize,
@@ -29,11 +36,21 @@ pub struct Wm {
     pub(in crate::gui) painting: Option<usize>,
     pub(in crate::gui) start_pressed: bool,
     pub(in crate::gui) last_click: Option<(u64, AppKind)>,
+    pub(in crate::gui) last_title_click: Option<(u64, usize)>,
     pub(in crate::gui) hover: (i32, i32),
     pub(in crate::gui) dirty: bool,
     pub(in crate::gui) cursor_dirty: bool,
     pub(in crate::gui) mods_shift: bool,
     pub(in crate::gui) mods_ctrl: bool,
+    pub(in crate::gui) mods_alt: bool,
+
+    pub(in crate::gui) anim: anim::AnimState,
+    pub(in crate::gui) switcher_open: bool,
+    pub(in crate::gui) switcher_selected: usize,
+    pub(in crate::gui) snap_zone: Option<state::SnapZone>,
+    pub(in crate::gui) prev_alt: bool,
+
+    pub(in crate::gui) wallpaper: Option<WallpaperBuf>,
 }
 
 pub fn run() -> ! {
@@ -58,9 +75,10 @@ pub fn run() -> ! {
         }
 
         {
-            let (shift, ctrl, _alt) = keyboard::modifiers();
+            let (shift, ctrl, alt) = keyboard::modifiers();
             wm.mods_shift = shift;
             wm.mods_ctrl = ctrl;
+            wm.mods_alt = alt;
         }
 
         while let Some(ev) = mouse::pop_event() {
@@ -85,9 +103,44 @@ pub fn run() -> ! {
             }
         }
 
-        while let Some(k) = keyboard::pop() {
-            let (_, ctrl, alt) = keyboard::modifiers();
-            wm.on_key(k, ctrl, alt);
+        if !keyboard::user_owns() {
+            while let Some(k) = keyboard::pop() {
+                let (_, ctrl, alt) = keyboard::modifiers();
+                wm.on_key(k, ctrl, alt);
+                wm.dirty = true;
+            }
+        }
+
+        if wm.switcher_open && !wm.mods_alt {
+            wm.switcher_close_and_apply();
+            wm.dirty = true;
+        }
+
+        // Применяем rect-анимацию к окну + финализируем по завершении.
+        let mut finalize: Option<(usize, anim::RectOnDone)> = None;
+        if let Some(rc) = &wm.anim.rect_anim {
+            let idx = rc.win_idx;
+            if idx < wm.windows.len() {
+                let (nx, ny, nw, nh) = rc.current();
+                wm.windows[idx].x = nx;
+                wm.windows[idx].y = ny;
+                wm.windows[idx].w = nw;
+                wm.windows[idx].h = nh;
+                if rc.done() {
+                    finalize = Some((idx, rc.on_done));
+                }
+            } else {
+                wm.anim.rect_anim = None;
+            }
+        }
+        if let Some((idx, on_done)) = finalize {
+            wm.anim.rect_anim = None;
+            if idx < wm.windows.len() && on_done == anim::RectOnDone::Minimize {
+                wm.windows[idx].minimized = true;
+            }
+        }
+
+        if wm.anim.tick() {
             wm.dirty = true;
         }
 
@@ -144,14 +197,47 @@ impl Wm {
             painting: None,
             start_pressed: false,
             last_click: None,
+            last_title_click: None,
             hover: mouse::position(),
             dirty: true,
             cursor_dirty: false,
             mods_shift: false,
             mods_ctrl: false,
+            mods_alt: false,
+            anim: anim::AnimState::new(),
+            switcher_open: false,
+            switcher_selected: 0,
+            snap_zone: None,
+            prev_alt: false,
+            wallpaper: None,
         };
+        wm.load_wallpaper();
         wm.open_app(AppKind::Explorer);
         wm
+    }
+
+    fn load_wallpaper(&mut self) {
+        let names = ["WALLPAPER.BMP", "wallpaper.bmp", "WALLPAPER.bmp"];
+        for name in &names {
+            if let Some(data) = crate::vfs::fat32_read_file(name) {
+                crate::serial_println!("[wallpaper] {} size={}", name, data.len());
+                if let Some(bmp) = crate::bmp::decode(&data) {
+                    crate::serial_println!(
+                        "[wallpaper] decoded {}x{}",
+                        bmp.width, bmp.height
+                    );
+                    self.wallpaper = Some(WallpaperBuf {
+                        width: bmp.width,
+                        height: bmp.height,
+                        pixels: bmp.pixels,
+                    });
+                    return;
+                } else {
+                    crate::serial_println!("[wallpaper] decode failed");
+                }
+            }
+        }
+        crate::serial_println!("[wallpaper] no wallpaper, using gradient");
     }
 
     pub(in crate::gui) fn focus_window(&mut self, idx: usize) {
@@ -159,6 +245,20 @@ impl Wm {
         if idx != self.windows.len() - 1 {
             let win = self.windows.remove(idx);
             self.windows.push(win);
+            for a in self.anim.window_anims.iter_mut() {
+                if a.win_idx == idx {
+                    a.win_idx = self.windows.len() - 1;
+                } else if a.win_idx > idx {
+                    a.win_idx -= 1;
+                }
+            }
+            if let Some(r) = &mut self.anim.rect_anim {
+                if r.win_idx == idx {
+                    r.win_idx = self.windows.len() - 1;
+                } else if r.win_idx > idx {
+                    r.win_idx -= 1;
+                }
+            }
         }
         self.active = self.windows.len() - 1;
         self.windows[self.active].minimized = false;
@@ -168,6 +268,17 @@ impl Wm {
     pub(in crate::gui) fn close_active(&mut self) {
         if self.windows.is_empty() { return; }
         self.windows.remove(self.active);
+        self.anim.window_anims.retain(|a| a.win_idx != self.active);
+        for a in self.anim.window_anims.iter_mut() {
+            if a.win_idx > self.active { a.win_idx -= 1; }
+        }
+        if let Some(r) = &mut self.anim.rect_anim {
+            if r.win_idx == self.active {
+                self.anim.rect_anim = None;
+            } else if r.win_idx > self.active {
+                r.win_idx -= 1;
+            }
+        }
         if self.windows.is_empty() {
             self.active = 0;
         } else if self.active >= self.windows.len() {
@@ -256,10 +367,7 @@ impl Wm {
             AppKind::Todo => (
                 "Задачи".to_string(),
                 App::Todo {
-                    items: vec![
-                        "Написать UI".to_string(),
-                        "Добавить звук".to_string(),
-                    ],
+                    items: vec!["Написать UI".to_string(), "Добавить звук".to_string()],
                     selected: None,
                     input: String::new(),
                 },
@@ -298,10 +406,21 @@ impl Wm {
             title,
             content,
             minimized: false,
+            restore_rect: None,
         });
         self.active = self.windows.len() - 1;
+        self.anim.start_open(self.active);
         self.dirty = true;
         sound::open();
+    }
+
+    pub(in crate::gui) fn switcher_close_and_apply(&mut self) {
+        if !self.switcher_open { return; }
+        let sel = self.switcher_selected;
+        self.switcher_open = false;
+        if sel < self.windows.len() {
+            self.focus_window(sel);
+        }
     }
 
     pub(in crate::gui) fn list_dir_entries(&self, path: &str) -> Vec<(String, bool, u32)> {
@@ -376,20 +495,18 @@ impl Wm {
             crate::serial_println!("[clip] copied {} items from {}", items.len(), p);
             self.clipboard = items;
             self.clipboard_from = p;
+            self.anim.toast("Скопировано", anim::ToastKind::Info);
         }
     }
 
     pub(in crate::gui) fn paste_clipboard(&mut self, active: usize) {
         if self.clipboard.is_empty() { return; }
-
         let (p, on_disk) = match &self.windows[active].content {
             App::Explorer { path, .. } => (path.clone(), path.starts_with("C:")),
             _ => return,
         };
-
         let items = self.clipboard.clone();
         let mut pasted = 0usize;
-
         if on_disk {
             for item in &items {
                 if !item.is_dir && crate::vfs::fat32_write_file(&item.name, &item.data) {
@@ -405,9 +522,8 @@ impl Wm {
                 }
             }
         }
-
         if pasted > 0 {
-            crate::serial_println!("[clip] pasted {} items into {}", pasted, p);
+            self.anim.toast("Вставлено", anim::ToastKind::Success);
         }
         self.dirty = true;
     }
@@ -443,22 +559,23 @@ impl Wm {
                 }
             }
         }
-
         if let App::Explorer { selected, anchor, .. } = &mut self.windows[active].content {
             selected.clear();
             *anchor = None;
         }
+        self.anim.toast("Удалено", anim::ToastKind::Warn);
         self.dirty = true;
     }
 
-    pub(in crate::gui) fn icons() -> [(AppKind, &'static str, char, framebuffer::Color); 5] {
+    pub(in crate::gui) fn icons() -> [(AppKind, &'static str, icons::IconKind, framebuffer::Color); 5] {
         use framebuffer::Color;
+        use icons::IconKind;
         [
-            (AppKind::Explorer,   "Файлы",       'F', Color { r: 255, g: 195, b: 70 }),
-            (AppKind::Notepad,    "Блокнот",     'N', Color { r: 100, g: 150, b: 255 }),
-            (AppKind::Todo,       "Задачи",      'T', Color { r: 80,  g: 200, b: 120 }),
-            (AppKind::Calculator, "Калькулятор", 'C', Color { r: 240, g: 150, b: 60  }),
-            (AppKind::Paint,      "Paint",       'P', Color { r: 220, g: 90,  b: 180 }),
+            (AppKind::Explorer,   "Файлы",       IconKind::Folder,   Color { r: 255, g: 195, b: 70  }),
+            (AppKind::Notepad,    "Блокнот",     IconKind::Notepad,  Color { r: 100, g: 150, b: 255 }),
+            (AppKind::Todo,       "Задачи",      IconKind::Todo,     Color { r: 80,  g: 200, b: 120 }),
+            (AppKind::Calculator, "Калькулятор", IconKind::Calc,     Color { r: 240, g: 150, b: 60  }),
+            (AppKind::Paint,      "Paint",       IconKind::Paint,    Color { r: 220, g: 90,  b: 180 }),
         ]
     }
 

@@ -11,6 +11,8 @@ use x86_64::structures::paging::{
 };
 use x86_64::VirtAddr;
 
+use crate::{log_debug, log_warn};
+
 #[derive(Debug)]
 pub enum ElfError {
     BadMagic,
@@ -19,11 +21,11 @@ pub enum ElfError {
     NotExec,
     BadOffset,
     MapFailed,
+    EntryOutsideSegments,
 }
 
 pub struct LoadedElf {
     pub entry: u64,
-    /// (vaddr_start, vaddr_end, flags) для каждого загруженного сегмента.
     pub segments: Vec<(u64, u64, PageTableFlags)>,
 }
 
@@ -46,8 +48,6 @@ pub fn load(
     }
 
     let e_type = u16::from_le_bytes([data[16], data[17]]);
-    // 2 = ET_EXEC, 3 = ET_DYN. Принимаем оба — наш linker.ld задаёт
-    // абсолютную базу 0x400000, так что PIE-адреса уже абсолютные.
     if e_type != 2 && e_type != 3 {
         return Err(ElfError::NotExec);
     }
@@ -105,7 +105,6 @@ pub fn load(
             }
         }
 
-        // Копируем содержимое.
         if p_filesz > 0 {
             if p_offset + p_filesz > data.len() {
                 return Err(ElfError::BadOffset);
@@ -119,7 +118,6 @@ pub fn load(
             }
         }
 
-        // Обнуляем хвост memsz (bss).
         let remaining = p_memsz - p_filesz;
         if remaining > 0 {
             unsafe {
@@ -130,5 +128,21 @@ pub fn load(
         segments.push((vstart, vend, flags));
     }
 
+    let mut entry_ok = false;
+    for (vstart, vend, _) in &segments {
+        if e_entry >= *vstart && e_entry < *vend {
+            entry_ok = true;
+            break;
+        }
+    }
+    if !entry_ok {
+        log_warn!(
+            "[elf] entry {:#x} не входит в сегменты — битый ELF",
+            e_entry
+        );
+        return Err(ElfError::EntryOutsideSegments);
+    }
+
+    log_debug!("[elf] loaded, entry={:#x}, segments={}", e_entry, segments.len());
     Ok(LoadedElf { entry: e_entry, segments })
 }

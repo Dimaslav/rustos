@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -8,13 +8,21 @@ fn main() {
     let kernel_dir = PathBuf::from("kernel");
     let kernel_target = "x86_64-unknown-none";
 
+    // Пробрасываем фичу headless_test в kernel, если она включена у root-пакета.
+    let headless = std::env::var("CARGO_FEATURE_HEADLESS_TEST").is_ok();
+    let mut kernel_args: Vec<&str> = vec![
+        "build", "--release", "--target", kernel_target,
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ];
+    if headless {
+        kernel_args.push("--features");
+        kernel_args.push("headless_test");
+    }
+
     let status = Command::new("cargo")
         .current_dir(&kernel_dir)
-        .args([
-            "build", "--release", "--target", kernel_target,
-            "-Zbuild-std=core,alloc,compiler_builtins",
-            "-Zbuild-std-features=compiler-builtins-mem",
-        ])
+        .args(&kernel_args)
         .status()
         .expect("Не удалось запустить сборку ядра");
     if !status.success() {
@@ -37,6 +45,11 @@ fn main() {
     println!("cargo:rustc-env=BIOS_PATH={}", bios_path.display());
     println!("cargo:rerun-if-changed=kernel");
     println!("cargo:rerun-if-changed=user");
+    println!("cargo:rerun-if-changed=user/linker.ld");
+    println!("cargo:rerun-if-changed=user/.cargo/config.toml");
+    for name in ["user", "worker", "calculator", "shell"] {
+        println!("cargo:rerun-if-changed=kernel/{}.elf", name);
+    }
 }
 
 fn build_user_programs() {
@@ -45,21 +58,91 @@ fn build_user_programs() {
 
     let status = Command::new("cargo")
         .current_dir(&user_dir)
-        .args(["build", "--release", "--target", target, "-Zbuild-std=core"])
+        .args([
+            "build",
+            "--release",
+            "--target", target,
+            "-Zbuild-std=core,compiler_builtins",
+            "-Zbuild-std-features=compiler-builtins-mem",
+        ])
         .status()
         .expect("Не удалось собрать user-программы");
     if !status.success() {
         panic!("Сборка user-программ завершилась с ошибкой");
     }
 
-    for name in ["user", "worker", "calculator"] {
+    for name in ["user", "worker", "calculator", "shell"] {
         let base = user_dir.join("target").join(target).join("release");
         let a = base.join(name);
         let b = base.join(format!("{}.exe", name));
         let src = if a.exists() { a } else { b };
+
         let dst = PathBuf::from("kernel").join(format!("{}.elf", name));
         std::fs::copy(&src, &dst)
             .unwrap_or_else(|e| panic!("copy {} → {}: {}", src.display(), dst.display(), e));
-        eprintln!("User ELF: {} → {}", src.display(), dst.display());
+
+        fixup_elf_base(&dst, 0x40_0000)
+            .unwrap_or_else(|e| panic!("fixup {}: {}", dst.display(), e));
+
+        let bytes = std::fs::read(&dst).unwrap();
+        let e_type = u16::from_le_bytes([bytes[16], bytes[17]]);
+        let e_entry = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        eprintln!(
+            "[build] {} size={} type={} e_entry={:#x}",
+            dst.display(), bytes.len(), e_type, e_entry
+        );
+
+        if e_type != 2 || e_entry < 0x40_0000 {
+            panic!(
+                "после fixup ожидали ET_EXEC с entry ≥ 0x400000, получили type={} entry={:#x}",
+                e_type, e_entry
+            );
+        }
     }
+}
+
+/// Сдвигает ELF с базы 0 на базу `base`.
+fn fixup_elf_base(path: &Path, base: u64) -> Result<(), String> {
+    let mut bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.len() < 64 || &bytes[0..4] != b"\x7FELF" {
+        return Err("not ELF".into());
+    }
+    if bytes[4] != 2 {
+        return Err("not ELF64".into());
+    }
+
+    let e_type = u16::from_le_bytes([bytes[16], bytes[17]]);
+    let e_entry_before = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+
+    if e_type == 2 && e_entry_before >= base {
+        return Ok(());
+    }
+    if e_type != 2 && e_type != 3 {
+        return Err(format!("unsupported e_type={}", e_type));
+    }
+
+    bytes[16] = 2;
+    bytes[17] = 0;
+    bytes[24..32].copy_from_slice(&(e_entry_before + base).to_le_bytes());
+
+    let e_phoff = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+    let e_phentsize = u16::from_le_bytes([bytes[54], bytes[55]]) as usize;
+    let e_phnum = u16::from_le_bytes([bytes[56], bytes[57]]) as usize;
+
+    if e_phoff + e_phnum * e_phentsize > bytes.len() {
+        return Err("phdr за пределами файла".into());
+    }
+
+    for i in 0..e_phnum {
+        let p = e_phoff + i * e_phentsize;
+        let p_type = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+        if p_type != 1 { continue; }
+        let v = u64::from_le_bytes(bytes[p + 16..p + 24].try_into().unwrap());
+        bytes[p + 16..p + 24].copy_from_slice(&(v + base).to_le_bytes());
+        let a = u64::from_le_bytes(bytes[p + 24..p + 32].try_into().unwrap());
+        bytes[p + 24..p + 32].copy_from_slice(&(a + base).to_le_bytes());
+    }
+
+    std::fs::write(path, &bytes).map_err(|e| e.to_string())?;
+    Ok(())
 }

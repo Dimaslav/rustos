@@ -190,6 +190,36 @@ impl Writer {
         }
     }
 
+    /// Alpha-наложение: blend существующего пикселя с `color` через `alpha` (0..255).
+    pub fn blend_pixel(&mut self, x: usize, y: usize, color: Color, alpha: u8) {
+        if x >= self.width || y >= self.height || alpha == 0 { return; }
+        if alpha == 255 { self.set_pixel(x, y, color); return; }
+        let offset = y * self.stride * self.bpp + x * self.bpp;
+        let inv = 255 - alpha as u32;
+        let a = alpha as u32;
+        let (r, g, b) = match self.format {
+            PixelFormat::Rgb => (self.back[offset], self.back[offset + 1], self.back[offset + 2]),
+            PixelFormat::Bgr => (self.back[offset + 2], self.back[offset + 1], self.back[offset]),
+            _ => return,
+        };
+        let nr = ((color.r as u32 * a + r as u32 * inv) / 255) as u8;
+        let ng = ((color.g as u32 * a + g as u32 * inv) / 255) as u8;
+        let nb = ((color.b as u32 * a + b as u32 * inv) / 255) as u8;
+        match self.format {
+            PixelFormat::Rgb => {
+                self.back[offset] = nr;
+                self.back[offset + 1] = ng;
+                self.back[offset + 2] = nb;
+            }
+            PixelFormat::Bgr => {
+                self.back[offset] = nb;
+                self.back[offset + 1] = ng;
+                self.back[offset + 2] = nr;
+            }
+            _ => {}
+        }
+    }
+
     pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: Color) {
         let x1 = (x + w).min(self.width);
         let y1 = (y + h).min(self.height);
@@ -282,6 +312,59 @@ impl Writer {
                     self.set_pixel(x + dx, y + h - 1 - dy, color);
                     self.set_pixel(x + w - 1 - dx, y + h - 1 - dy, color);
                 }
+            }
+        }
+    }
+
+    /// Anti-aliased закруглённый прямоугольник.
+    ///
+    /// Работает без `f32::sqrt` — использует квадрат расстояния и
+    /// линейное приближение для alpha (погрешность < 1/255).
+    pub fn fill_round_rect_aa(
+        &mut self, x: usize, y: usize, w: usize, h: usize,
+        radius: usize, color: Color,
+    ) {
+        if w == 0 || h == 0 || radius == 0 {
+            self.fill_rect(x, y, w, h, color);
+            return;
+        }
+        if w < 2 * radius || h < 2 * radius {
+            self.fill_rect(x, y, w, h, color);
+            return;
+        }
+        self.fill_rect(x + radius, y, w - 2 * radius, h, color);
+        self.fill_rect(x, y + radius, radius, h - 2 * radius, color);
+        self.fill_rect(x + w - radius, y + radius, radius, h - 2 * radius, color);
+
+        let r = radius as f32;
+        let cx = r - 0.5;
+        let cy = r - 0.5;
+        let dr = r + 0.5;
+        let dr2 = dr * dr;
+        let r05 = r - 0.5;
+        let r05_2 = r05 * r05;
+        let two_dr = 2.0 * dr;
+
+        for dy in 0..radius {
+            for dx in 0..radius {
+                let ax = dx as f32 - cx;
+                let ay = dy as f32 - cy;
+                let d2 = ax * ax + ay * ay;
+                let alpha: u8 = if d2 <= r05_2 {
+                    255
+                } else if d2 >= dr2 {
+                    continue;
+                } else {
+                    // alpha = 255 * (dr - d), где d = sqrt(d2).
+                    // Приближаем: dr - d ≈ (dr² - d²) / (2·dr).
+                    let t = ((dr2 - d2) / two_dr) * 255.0;
+                    if t <= 0.0 { continue; }
+                    if t >= 255.0 { 255 } else { t as u8 }
+                };
+                self.blend_pixel(x + dx, y + dy, color, alpha);
+                self.blend_pixel(x + w - 1 - dx, y + dy, color, alpha);
+                self.blend_pixel(x + dx, y + h - 1 - dy, color, alpha);
+                self.blend_pixel(x + w - 1 - dx, y + h - 1 - dy, color, alpha);
             }
         }
     }

@@ -10,15 +10,35 @@ use crate::keyboard::Key;
 use crate::mouse;
 use crate::widgets::{self, BUTTON_H, FIELD_H, ROW_H};
 
+use super::anim::RectOnDone;
 use super::chrome::calc_layout;
 use super::notepad;
 use super::state::*;
 use super::theme;
 use super::Wm;
 
+/// Окно «двойного клика» в тиках (~0.33 сек).
+const DOUBLE_CLICK_TICKS: u64 = 6;
+
 impl Wm {
     pub(in crate::gui) fn on_move(&mut self, x: i32, y: i32) {
         self.hover = (x, y);
+
+        if self.drag.is_some() {
+            let (sw, _sh) = mouse::screen_size();
+            self.snap_zone = if x < 20 {
+                Some(SnapZone::Left)
+            } else if x > sw - 20 {
+                Some(SnapZone::Right)
+            } else if y < 10 {
+                Some(SnapZone::Top)
+            } else {
+                None
+            };
+        } else {
+            self.snap_zone = None;
+        }
+
         if let Some(d) = &self.drag {
             let (idx, ox, oy) = (d.idx, d.ox, d.oy);
             if let Some(w) = self.windows.get_mut(idx) {
@@ -139,6 +159,62 @@ impl Wm {
         }
     }
 
+    /// Свернуть окно `idx` с анимацией.
+    ///
+    /// Внимание: сначала вычитываем все поля окна в локальные переменные, и
+    /// только потом мутируем `self.windows[idx]` — иначе borrow checker
+    /// ругается на одновременный `&` и `&mut self.windows` (E0502).
+    fn minimize_window(&mut self, idx: usize) {
+        if idx >= self.windows.len() { return; }
+
+        let (from_x, from_y, from_w, from_h) = {
+            let win = &self.windows[idx];
+            (win.x, win.y, win.w, win.h)
+        };
+        let from = (from_x, from_y, from_w, from_h);
+
+        self.windows[idx].restore_rect = Some(from);
+
+        let (_, sh) = mouse::screen_size();
+        let to = (from_x, sh + 20, from_w, from_h);
+        self.anim.start_rect(idx, from, to, RectOnDone::Minimize);
+    }
+
+    /// Развернуть окно `idx` с анимацией.
+    fn restore_window(&mut self, idx: usize) {
+        if idx >= self.windows.len() { return; }
+        let to = self.windows[idx].restore_rect.take().unwrap_or_else(|| {
+            let off = idx as i32 * 28;
+            (100 + off, 70 + off, self.windows[idx].w, self.windows[idx].h)
+        });
+        let from = (to.0, mouse::screen_size().1 + 20, to.2, to.3);
+        self.windows[idx].minimized = false;
+        self.anim.start_rect(idx, from, to, RectOnDone::None);
+        self.focus_window(idx);
+    }
+
+    /// Максимизировать/восстановить окно `idx`.
+    fn toggle_maximize(&mut self, idx: usize) {
+        if idx >= self.windows.len() { return; }
+        let (sw, sh) = mouse::screen_size();
+        let taskbar_h = TASKBAR_H as i32;
+        if self.windows[idx].restore_rect.is_some() {
+            // Восстановить.
+            let to = self.windows[idx].restore_rect.take().unwrap();
+            let win = &self.windows[idx];
+            let from = (win.x, win.y, win.w, win.h);
+            self.anim.start_rect(idx, from, to, RectOnDone::None);
+        } else {
+            // Максимизировать.
+            let win = &self.windows[idx];
+            let from = (win.x, win.y, win.w, win.h);
+            self.windows[idx].restore_rect = Some(from);
+            let to = (0, 0, sw as usize, (sh - taskbar_h) as usize);
+            self.anim.start_rect(idx, from, to, RectOnDone::None);
+        }
+        self.dirty = true;
+    }
+
     pub(in crate::gui) fn on_left_down(&mut self, x: i32, y: i32) {
         self.dirty = true;
 
@@ -172,7 +248,10 @@ impl Wm {
                                     }
                                 }
                             }
-                            "Сменить тему" => theme::toggle(),
+                            "Сменить тему" => {
+                                theme::toggle();
+                                self.anim.toast("Тема изменена", super::anim::ToastKind::Info);
+                            }
                             "О системе" => {
                                 let text = "Rust OS v0.9\n\nRust OS — учебная ОС на Rust.\n";
                                 self.spawn_app(AppKind::Notepad, Some(("О системе.txt".to_string(), text.to_string())));
@@ -194,14 +273,20 @@ impl Wm {
             self.dirty = true;
         }
 
+        // Taskbar.
         if (y as usize) >= taskbar_y {
             if x < 78 { self.start_pressed = !self.start_pressed; return; }
             let mut bx = 86;
-            for (idx, w) in self.windows.iter().enumerate() {
-                let bw = crate::framebuffer::Writer::text_width(&w.title) + 24;
+            for idx in 0..self.windows.len() {
+                let bw = crate::framebuffer::Writer::text_width(&self.windows[idx].title) + 24;
                 if (x as usize) >= bx && (x as usize) < bx + bw {
-                    if idx == self.active { self.windows[idx].minimized = !self.windows[idx].minimized; }
-                    else { self.focus_window(idx); }
+                    if idx == self.active && !self.windows[idx].minimized {
+                        self.minimize_window(idx);
+                    } else if self.windows[idx].minimized {
+                        self.restore_window(idx);
+                    } else {
+                        self.focus_window(idx);
+                    }
                     return;
                 }
                 bx += bw + 4;
@@ -222,7 +307,6 @@ impl Wm {
             }
         }
 
-        // Foreign окна — до kernel-окон.
         if let Some((id, lx, ly)) = crate::win::hit_test(x, y) {
             if let Some(pid) = crate::win::pid_of(id) {
                 crate::win::push_event_to_pid(pid, crate::win::WinEvent {
@@ -254,9 +338,26 @@ impl Wm {
             if rel_y < TITLE_H {
                 let cb_x = ww.saturating_sub(8 + CLOSE_BTN_W);
                 let mb_x = cb_x.saturating_sub(6 + MIN_BTN_W);
-                if rel_x >= cb_x { self.close_active(); }
-                else if rel_x >= mb_x { let i = self.active; self.windows[i].minimized = true; }
-                else { self.drag = Some(Drag { idx: self.active, ox: x - wx, oy: y - wy }); }
+                if rel_x >= cb_x {
+                    self.close_active();
+                } else if rel_x >= mb_x {
+                    let i = self.active;
+                    self.minimize_window(i);
+                } else {
+                    // Двойной клик на заголовке = maximize/restore.
+                    let now = ticks();
+                    let dbl = matches!(
+                        self.last_title_click,
+                        Some((t, i)) if i == idx && now.saturating_sub(t) < DOUBLE_CLICK_TICKS
+                    );
+                    if dbl {
+                        self.last_title_click = None;
+                        self.toggle_maximize(idx);
+                    } else {
+                        self.last_title_click = Some((now, idx));
+                        self.drag = Some(Drag { idx: self.active, ox: x - wx, oy: y - wy });
+                    }
+                }
             } else {
                 self.handle_content_click(x, y);
             }
@@ -264,6 +365,37 @@ impl Wm {
     }
 
     pub(in crate::gui) fn on_button_up(&mut self, x: i32, y: i32) {
+        if self.drag.is_some() {
+            if let Some(zone) = self.snap_zone.take() {
+                let (sw, sh) = mouse::screen_size();
+                let idx = self.active;
+                if idx < self.windows.len() {
+                    let taskbar_h = TASKBAR_H as i32;
+                    let win = &self.windows[idx];
+                    let from = (win.x, win.y, win.w, win.h);
+                    let to = match zone {
+                        SnapZone::Left => (
+                            0, 0,
+                            (sw / 2) as usize,
+                            (sh - taskbar_h) as usize,
+                        ),
+                        SnapZone::Right => (
+                            sw / 2, 0,
+                            (sw / 2) as usize,
+                            (sh - taskbar_h) as usize,
+                        ),
+                        SnapZone::Top => (
+                            0, 0,
+                            sw as usize,
+                            (sh - taskbar_h) as usize,
+                        ),
+                    };
+                    self.anim.start_rect(idx, from, to, RectOnDone::None);
+                }
+            }
+        }
+        self.snap_zone = None;
+
         if let Some((id, lx, ly)) = crate::win::hit_test(x, y) {
             if let Some(pid) = crate::win::pid_of(id) {
                 crate::win::push_event_to_pid(pid, crate::win::WinEvent {
@@ -675,9 +807,20 @@ impl Wm {
     }
 
     pub(in crate::gui) fn on_key(&mut self, k: Key, ctrl: bool, alt: bool) {
-        if alt && k == Key::Tab && !self.windows.is_empty() {
-            let next = (self.active + 1) % self.windows.len();
-            self.focus_window(next);
+        if alt && k == Key::Tab {
+            if self.windows.is_empty() { return; }
+            if !self.switcher_open {
+                self.switcher_open = true;
+                self.switcher_selected = if self.windows.len() > 1 {
+                    (self.active + 1) % self.windows.len()
+                } else {
+                    self.active
+                };
+            } else {
+                let n = self.windows.len();
+                self.switcher_selected = (self.switcher_selected + 1) % n;
+            }
+            self.dirty = true;
             return;
         }
         if alt && k == Key::F(4) && !self.windows.is_empty() {
@@ -746,6 +889,7 @@ impl Wm {
                                 *modified = false;
                                 *mode = NotepadMode::Browse;
                             }
+                            self.anim.toast("Файл сохранён", super::anim::ToastKind::Success);
                         }
                     }
                     Key::Backspace => { name.pop(); }
@@ -788,9 +932,11 @@ impl Wm {
                             if let Some(name) = path.strip_prefix("C:/") {
                                 if crate::vfs::fat32_write_file(name, text.as_bytes()) {
                                     *modified = false;
+                                    self.anim.toast("Сохранено", super::anim::ToastKind::Success);
                                 }
                             } else if crate::vfs::ramfs_write(&path, text.as_bytes()) {
                                 *modified = false;
+                                self.anim.toast("Сохранено", super::anim::ToastKind::Success);
                             }
                         } else {
                             *mode = NotepadMode::SaveAs { name: String::new() };
@@ -863,7 +1009,10 @@ impl Wm {
                             } else {
                                 crate::vfs::ramfs_mkdir(&p, &n)
                             };
-                            if ok { *mode = ExplorerMode::Browse; }
+                            if ok {
+                                *mode = ExplorerMode::Browse;
+                                self.anim.toast("Папка создана", super::anim::ToastKind::Success);
+                            }
                         }
                         Key::Backspace => { name.pop(); }
                         Key::Char(c) => name.push(c as char),
@@ -876,9 +1025,11 @@ impl Wm {
                             if p.starts_with("C:") {
                                 if crate::vfs::fat32_create_file(&n) {
                                     *mode = ExplorerMode::Browse;
+                                    self.anim.toast("Файл создан", super::anim::ToastKind::Success);
                                 }
                             } else if crate::vfs::ramfs_create_file(&p, &n, b"") {
                                 *mode = ExplorerMode::Browse;
+                                self.anim.toast("Файл создан", super::anim::ToastKind::Success);
                             }
                         }
                         Key::Backspace => { name.pop(); }
@@ -896,6 +1047,7 @@ impl Wm {
                                     if let Some((old, _, _)) = entries.get(i) {
                                         if crate::vfs::fat32_rename(old, &n) {
                                             *mode = ExplorerMode::Browse;
+                                            self.anim.toast("Переименовано", super::anim::ToastKind::Success);
                                         }
                                     }
                                 } else {
@@ -904,6 +1056,7 @@ impl Wm {
                                         let full = fs::join(&p, old);
                                         if crate::vfs::ramfs_rename(&full, &n) {
                                             *mode = ExplorerMode::Browse;
+                                            self.anim.toast("Переименовано", super::anim::ToastKind::Success);
                                         }
                                     }
                                 }

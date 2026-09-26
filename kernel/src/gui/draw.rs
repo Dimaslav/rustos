@@ -8,7 +8,9 @@ use crate::framebuffer::{Color, Writer, FONT_HEIGHT};
 use crate::interrupts::uptime_secs;
 use crate::widgets;
 
+use super::anim;
 use super::chrome::*;
+use super::icons;
 use super::state::*;
 use super::theme;
 use super::Wm;
@@ -16,14 +18,18 @@ use super::Wm;
 impl Wm {
     pub(in crate::gui) fn draw(&self, w: &mut Writer) {
         let p = theme::palette();
-        w.gradient_v(0, 0, w.width, w.height, p.wallpaper_top, p.wallpaper_bottom);
+        if let Some(wp) = &self.wallpaper {
+            draw_wallpaper(w, wp);
+        } else {
+            w.gradient_v(0, 0, w.width, w.height, p.wallpaper_top, p.wallpaper_bottom);
+        }
 
-        let icons = Self::icons();
+        let icons_arr = Self::icons();
         let selected_kind = self.last_click.map(|(_, k)| k);
-        for (i, (kind, label, ch, color)) in icons.iter().enumerate() {
+        for (i, (kind, label, icon_kind, color)) in icons_arr.iter().enumerate() {
             let (ix, iy, _, _) = Self::icon_rect(i);
             let sel = selected_kind == Some(*kind);
-            widgets::desktop_icon_modern(w, ix, iy, label, *ch, *color, sel);
+            widgets::desktop_icon_modern(w, ix, iy, label, *icon_kind, *color, sel);
         }
 
         for (idx, win) in self.windows.iter().enumerate() {
@@ -32,8 +38,6 @@ impl Wm {
             self.draw_window(w, win, active);
         }
 
-        // Foreign windows (user-owned). Без interrupts: держим FOREIGN lock
-        // и не должны быть преемпчены в user-поток, иначе deadlock.
         x86_64::instructions::interrupts::without_interrupts(|| {
             crate::win::with_windows(|list| {
                 for fw in list.iter() {
@@ -54,6 +58,118 @@ impl Wm {
 
         if self.start_pressed {
             self.draw_start_menu(w);
+        }
+
+        if let Some(zone) = self.snap_zone {
+            let sw = w.width;
+            let sh = w.height.saturating_sub(TASKBAR_H);
+            let overlay = Color { r: 90, g: 140, b: 255 };
+            let (rx, ry, rw, rh) = match zone {
+                SnapZone::Left  => (0, 0, sw / 2, sh),
+                SnapZone::Right => (sw / 2, 0, sw / 2, sh),
+                SnapZone::Top   => (0, 0, sw, sh),
+            };
+            for yy in ry..(ry + rh) {
+                for xx in rx..(rx + rw) {
+                    w.blend_pixel(xx, yy, overlay, 60);
+                }
+            }
+        }
+
+        if self.switcher_open {
+            self.draw_switcher(w);
+        }
+
+        self.draw_toasts(w);
+    }
+
+    fn draw_switcher(&self, w: &mut Writer) {
+        let p = theme::palette();
+        let n = self.windows.len();
+        if n == 0 { return; }
+
+        let card_w = 180usize;
+        let card_h = 100usize;
+        let gap = 16usize;
+        let total_w = n * card_w + (n.saturating_sub(1)) * gap;
+        let start_x = (w.width.saturating_sub(total_w)) / 2;
+        let y = (w.height.saturating_sub(card_h + 40)) / 2;
+
+        for yy in 0..w.height {
+            for xx in 0..w.width {
+                w.blend_pixel(xx, yy, Color { r: 0, g: 0, b: 0 }, 90);
+            }
+        }
+
+        for (i, win) in self.windows.iter().enumerate() {
+            let x = start_x + i * (card_w + gap);
+            let selected = i == self.switcher_selected;
+            let bg = if selected { p.accent } else { p.window_bg_alt };
+
+            w.fill_round_rect_aa(x, y, card_w, card_h, 12, bg);
+
+            let (icon_kind, icon_color) = match &win.content {
+                App::Explorer { .. }   => (icons::IconKind::Folder,  Color { r: 255, g: 195, b: 70  }),
+                App::Notepad { .. }    => (icons::IconKind::Notepad, Color { r: 100, g: 150, b: 255 }),
+                App::Todo { .. }       => (icons::IconKind::Todo,    Color { r: 80,  g: 200, b: 120 }),
+                App::Calculator { .. } => (icons::IconKind::Calc,    Color { r: 240, g: 150, b: 60  }),
+                App::Paint { .. }      => (icons::IconKind::Paint,   Color { r: 220, g: 90,  b: 180 }),
+            };
+
+            w.fill_round_rect_aa(x + card_w / 2 - 20, y + 14, 40, 40, 10, icon_color);
+            icons::draw(
+                icon_kind, w,
+                x + card_w / 2 - 20 + 6,
+                y + 14 + 6,
+                28,
+                Color::WHITE,
+            );
+
+            let title_w = Writer::text_width(&win.title);
+            let tx = x + (card_w.saturating_sub(title_w)) / 2;
+            w.draw_text_at(tx, y + card_h - 26, &win.title, p.text, bg);
+        }
+    }
+
+    fn draw_toasts(&self, w: &mut Writer) {
+        let p = theme::palette();
+        let toast_w = 260usize;
+        let toast_h = 44usize;
+        let gap = 8usize;
+        let base_x = w.width.saturating_sub(toast_w + 16) as i32;
+        let base_y = w.height.saturating_sub(TASKBAR_H + 20) as i32;
+
+        for (i, t) in self.anim.toasts.iter().enumerate() {
+            let alpha = t.alpha();
+            if alpha == 0 { continue; }
+            let x = (base_x + t.offset_x()) as usize;
+            let y = (base_y - ((i as i32 + 1) * (toast_h + gap) as i32)) as usize;
+
+            let accent = match t.kind {
+                anim::ToastKind::Info    => p.accent,
+                anim::ToastKind::Success => Color { r: 60, g: 180, b: 90 },
+                anim::ToastKind::Warn    => p.danger,
+            };
+
+            if alpha == 255 {
+                w.fill_round_rect_aa(x, y, toast_w, toast_h, 8, p.window_bg_alt);
+                w.fill_round_rect_aa(x, y, 4, toast_h, 2, accent);
+                w.draw_text_at(x + 14, y + (toast_h - FONT_HEIGHT) / 2, &t.text, p.text, p.window_bg_alt);
+            } else {
+                w.fill_round_rect_aa(x, y, toast_w, toast_h, 8, p.window_bg_alt);
+                w.fill_round_rect_aa(x, y, 4, toast_h, 2, accent);
+                w.draw_text_at(x + 14, y + (toast_h - FONT_HEIGHT) / 2, &t.text, p.text, p.window_bg_alt);
+                // Полупрозрачный слой фона поверх toast'а — эффект затухания.
+                let wp_color = p.wallpaper_top;
+                let inv = 255 - alpha;
+                if inv > 0 {
+                    for yy in y..(y + toast_h) {
+                        for xx in x..(x + toast_w) {
+                            w.blend_pixel(xx, yy, wp_color, inv);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -91,11 +207,11 @@ impl Wm {
         let ww = win.w;
         let wh = win.h;
 
-        w.fill_round_rect(x + 4, y + 4, ww, wh, 10, p.shadow);
-        w.fill_round_rect(x, y, ww, wh, 10, p.window_bg);
+        w.fill_round_rect_aa(x + 4, y + 4, ww, wh, 10, p.shadow);
+        w.fill_round_rect_aa(x, y, ww, wh, 10, p.window_bg);
 
         let title_bg = if active { p.title_active } else { p.title_inactive };
-        w.fill_round_rect(x, y, ww, TITLE_H + 10, 10, title_bg);
+        w.fill_round_rect_aa(x, y, ww, TITLE_H + 10, 10, title_bg);
         w.fill_rect(x, y + TITLE_H, ww, 10, p.window_bg);
         w.draw_text_at(x + 14, y + (TITLE_H - FONT_HEIGHT) / 2, &win.title, p.text, title_bg);
 
@@ -509,16 +625,13 @@ fn draw_foreign(w: &mut Writer, fw: &crate::win::ForeignWindow) {
     let hh = fw.h as usize;
     let title_h = crate::win::TITLE_BAR_H as usize;
 
-    // Тень + тело (включая титул)
     w.fill_round_rect(x + 4, y + 4, ww, hh + title_h, 10, p.shadow);
     w.fill_round_rect(x, y, ww, hh + title_h, 10, p.window_bg);
 
-    // Титул
     let title_bg = p.title_active;
     w.fill_round_rect(x, y, ww, title_h, 10, title_bg);
     w.draw_text_at(x + 10, y + 5, &fw.title, p.text, title_bg);
 
-    // Содержимое — BGRA
     let cx = x;
     let cy = y + title_h;
     for yy in 0..hh {
@@ -529,6 +642,47 @@ fn draw_foreign(w: &mut Writer, fw: &crate::win::ForeignWindow) {
             let g = fw.shadow[off + 1];
             let r = fw.shadow[off + 2];
             w.set_pixel(cx + xx, cy + yy, Color { r, g, b });
+        }
+    }
+}
+
+/// Рисует BMP-обои с nearest-neighbor масштабированием под экран.
+fn draw_wallpaper(w: &mut Writer, wp: &super::WallpaperBuf) {
+    if wp.width == 0 || wp.height == 0 { return; }
+    let scr_w = w.width;
+    let scr_h = w.height;
+
+    if wp.width == scr_w && wp.height == scr_h {
+        for y in 0..scr_h {
+            for x in 0..scr_w {
+                let off = (y * wp.width + x) * 3;
+                let color = Color {
+                    r: wp.pixels[off],
+                    g: wp.pixels[off + 1],
+                    b: wp.pixels[off + 2],
+                };
+                w.set_pixel(x, y, color);
+            }
+        }
+        return;
+    }
+
+    let scale_x = ((wp.width as u64) << 16) / scr_w as u64;
+    let scale_y = ((wp.height as u64) << 16) / scr_h as u64;
+
+    for y in 0..scr_h {
+        let src_y = ((y as u64 * scale_y) >> 16) as usize;
+        let src_y = src_y.min(wp.height - 1);
+        for x in 0..scr_w {
+            let src_x = ((x as u64 * scale_x) >> 16) as usize;
+            let src_x = src_x.min(wp.width - 1);
+            let off = (src_y * wp.width + src_x) * 3;
+            let color = Color {
+                r: wp.pixels[off],
+                g: wp.pixels[off + 1],
+                b: wp.pixels[off + 2],
+            };
+            w.set_pixel(x, y, color);
         }
     }
 }

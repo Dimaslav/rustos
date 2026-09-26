@@ -1,47 +1,29 @@
 #![no_std]
 #![no_main]
 
-use core::arch::asm;
-
-#[inline(always)]
-unsafe fn syscall(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    let ret: u64;
-    asm!(
-        "int 0x80",
-        inlateout("rax") nr => ret,
-        in("rdi") a1,
-        in("rsi") a2,
-        in("rdx") a3,
-        options(nostack)
-    );
-    ret
-}
-
-fn write(buf: &[u8]) {
-    unsafe { syscall(1, 1, buf.as_ptr() as u64, buf.len() as u64); }
-}
-
-fn sleep_ms(ms: u64) {
-    unsafe { syscall(2, ms, 0, 0); }
-}
-
-fn exit(code: u64) -> ! {
-    unsafe { syscall(0, code, 0, 0); }
-    loop {}
-}
+use userlib::*;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     write(b"[worker] started\n");
-    for _ in 0..5 {
-        sleep_ms(700);
-        write(b"[worker] tick\n");
+    for i in 1..=10 {
+        sleep_ms(1000);
+        match i {
+            1 => write(b"[worker] tick 1\n"),
+            2 => write(b"[worker] tick 2\n"),
+            3 => write(b"[worker] tick 3\n"),
+            4 => write(b"[worker] tick 4\n"),
+            5 => write(b"[worker] tick 5\n"),
+            6 => write(b"[worker] tick 6\n"),
+            7 => write(b"[worker] tick 7\n"),
+            8 => write(b"[worker] tick 8\n"),
+            9 => write(b"[worker] tick 9\n"),
+            _ => write(b"[worker] tick 10\n"),
+        }
     }
     write(b"[worker] exiting\n");
     exit(0);
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }

@@ -38,22 +38,17 @@ pub fn draw_pencil_icon(w: &mut Writer, x: usize, y: usize, color: Color) {
     w.set_pixel(x + 2, y + 14, color);
 }
 
-pub fn draw_file_icon(w: &mut Writer, x: usize, y: usize, is_dir: bool, bg: Color) {
+pub fn draw_file_icon(w: &mut Writer, x: usize, y: usize, is_dir: bool, _bg: Color) {
     if is_dir {
-        let folder = Color { r: 240, g: 190, b: 80 };
-        w.fill_rect(x + 1, y + 4, 3, 3, folder);
-        w.fill_rect(x, y + 6, 12, 9, folder);
-        w.fill_rect(x, y + 6, 12, 1, Color { r: 200, g: 150, b: 50 });
+        crate::gui::icons::draw(
+            crate::gui::icons::IconKind::Folder, w, x, y, 16,
+            Color { r: 240, g: 190, b: 80 },
+        );
     } else {
-        let paper = Color { r: 230, g: 235, b: 245 };
-        let edge = Color { r: 140, g: 150, b: 170 };
-        w.fill_rect(x + 1, y + 2, 10, 14, paper);
-        w.fill_rect(x + 8, y + 2, 3, 3, bg);
-        w.fill_rect(x + 1, y + 2, 10, 1, edge);
-        w.fill_rect(x + 1, y + 15, 10, 1, edge);
-        w.fill_rect(x + 3, y + 6, 6, 1, edge);
-        w.fill_rect(x + 3, y + 9, 6, 1, edge);
-        w.fill_rect(x + 3, y + 12, 4, 1, edge);
+        crate::gui::icons::draw(
+            crate::gui::icons::IconKind::File, w, x, y, 16,
+            Color { r: 230, g: 235, b: 245 },
+        );
     }
 }
 

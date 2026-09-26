@@ -32,6 +32,14 @@ pub const START_MENU_ITEMS: [&str; 6] = [
 
 pub const START_MENU_H: usize = 272;
 
+/// Зона автоматической подгонки окна при перетаскивании к краю экрана.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnapZone {
+    Left,
+    Right,
+    Top,
+}
+
 #[derive(Clone, Copy)]
 pub enum Direction {
     Left,
@@ -130,6 +138,7 @@ pub struct Window {
     pub(in crate::gui) title: String,
     pub(in crate::gui) content: App,
     pub(in crate::gui) minimized: bool,
+    pub(in crate::gui) restore_rect: Option<(i32, i32, usize, usize)>,
 }
 
 pub struct Drag {

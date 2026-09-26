@@ -8,6 +8,10 @@ edition = "2021"
 [build-dependencies]
 bootloader = "0.11.17"
 
+[features]
+# Пробрасывается в build.rs → kernel. Прогон smoke-тестов без GUI.
+headless_test = []
+
 [profile.dev]
 panic = "abort"
 
