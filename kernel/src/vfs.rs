@@ -3,9 +3,14 @@
 //! Один глобальный `Vfs` владеет всеми файловыми системами:
 //! - RAMFS (in-memory дерево узлов) — mount на `/`
 //! - FAT32 (диск, LBA28)             — mount на `C:`
+//! - procfs (виртуальная FS)         — mount на `/proc`
 //!
 //! Все обращения идут через функции-обёртки, которые берут `VFS.lock()`
 //! и роутят по префиксу пути.
+//!
+//! `/proc` не хранит данных — содержимое генерируется на лету
+//! (см. `crate::procfs`). Точки интеграции: `read`, `list`, `ramfs_stat`,
+//! `exists`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -59,6 +64,13 @@ fn split(path: &str) -> (bool, &str) {
 // ---------- RAMFS wrappers ----------
 
 pub fn ramfs_list_meta(path: &str) -> Vec<(String, bool, usize)> {
+    // ИСПРАВЛЕНИЕ: /proc — виртуальная FS, листинг генерируется на лету.
+    if crate::procfs::is_proc_path(path) {
+        return crate::procfs::list(path)
+            .into_iter()
+            .map(|(n, d, s)| (n, d, s as usize))
+            .collect();
+    }
     let g = VFS.lock();
     let v = match g.as_ref() {
         Some(v) => v,
@@ -72,12 +84,19 @@ pub fn ramfs_list_meta(path: &str) -> Vec<(String, bool, usize)> {
 }
 
 pub fn ramfs_read(path: &str) -> Option<Vec<u8>> {
+    // ИСПРАВЛЕНИЕ: /proc — виртуальная FS, содержимое генерируется на лету.
+    if crate::procfs::is_proc_path(path) {
+        return crate::procfs::read(path);
+    }
     let g = VFS.lock();
     let v = g.as_ref()?;
     v.ramfs.read(path)
 }
 
 pub fn ramfs_write(path: &str, data: &[u8]) -> bool {
+    if crate::procfs::is_proc_path(path) {
+        return false; // /proc только для чтения
+    }
     let mut g = VFS.lock();
     let v = match g.as_mut() {
         Some(v) => v,
@@ -87,6 +106,9 @@ pub fn ramfs_write(path: &str, data: &[u8]) -> bool {
 }
 
 pub fn ramfs_create_file(parent: &str, name: &str, data: &[u8]) -> bool {
+    if crate::procfs::is_proc_path(parent) {
+        return false;
+    }
     let mut g = VFS.lock();
     let v = match g.as_mut() {
         Some(v) => v,
@@ -96,6 +118,9 @@ pub fn ramfs_create_file(parent: &str, name: &str, data: &[u8]) -> bool {
 }
 
 pub fn ramfs_mkdir(parent: &str, name: &str) -> bool {
+    if crate::procfs::is_proc_path(parent) {
+        return false;
+    }
     let mut g = VFS.lock();
     let v = match g.as_mut() {
         Some(v) => v,
@@ -105,6 +130,9 @@ pub fn ramfs_mkdir(parent: &str, name: &str) -> bool {
 }
 
 pub fn ramfs_remove(path: &str) -> bool {
+    if crate::procfs::is_proc_path(path) {
+        return false;
+    }
     let mut g = VFS.lock();
     let v = match g.as_mut() {
         Some(v) => v,
@@ -114,6 +142,9 @@ pub fn ramfs_remove(path: &str) -> bool {
 }
 
 pub fn ramfs_rename(path: &str, new_name: &str) -> bool {
+    if crate::procfs::is_proc_path(path) {
+        return false;
+    }
     let mut g = VFS.lock();
     let v = match g.as_mut() {
         Some(v) => v,
@@ -123,6 +154,10 @@ pub fn ramfs_rename(path: &str, new_name: &str) -> bool {
 }
 
 pub fn ramfs_exists(path: &str) -> bool {
+    // ИСПРАВЛЕНИЕ: /proc — виртуальная FS.
+    if crate::procfs::is_proc_path(path) {
+        return crate::procfs::exists(path);
+    }
     let g = VFS.lock();
     match g.as_ref() {
         Some(v) => v.ramfs.exists(path),
@@ -131,7 +166,14 @@ pub fn ramfs_exists(path: &str) -> bool {
 }
 
 /// `(size, is_dir)`. Директория → `(0, true)`.
+///
+/// ИСПРАВЛЕНИЕ: если путь под `/proc`, отдаём запрос в procfs.
+/// `syscall::sys_stat` зовёт именно `ramfs_stat` для не-`C:` путей,
+/// поэтому точка интеграции — здесь.
 pub fn ramfs_stat(path: &str) -> Option<(u64, bool)> {
+    if crate::procfs::is_proc_path(path) {
+        return crate::procfs::stat(path);
+    }
     let g = VFS.lock();
     let v = g.as_ref()?;
     if v.ramfs.is_dir(path) {
@@ -358,6 +400,13 @@ pub fn fat32_stat_path(path: &str) -> Option<(u64, bool)> {
 // ---------- Единый API ----------
 
 pub fn list(path: &str) -> VfsResult<Vec<VfsEntry>> {
+    // ИСПРАВЛЕНИЕ: /proc — виртуальная FS, листинг генерируется на лету.
+    if crate::procfs::is_proc_path(path) {
+        return Ok(crate::procfs::list(path)
+            .into_iter()
+            .map(|(n, d, s)| VfsEntry { name: n, is_dir: d, size: s })
+            .collect());
+    }
     let (is_fat, _) = split(path);
     if is_fat {
         Ok(fat32_list_dir(path)
@@ -373,6 +422,10 @@ pub fn list(path: &str) -> VfsResult<Vec<VfsEntry>> {
 }
 
 pub fn read(path: &str) -> VfsResult<Vec<u8>> {
+    // ИСПРАВЛЕНИЕ: /proc — виртуальная FS, содержимое генерируется на лету.
+    if crate::procfs::is_proc_path(path) {
+        return crate::procfs::read(path).ok_or(VfsError::NotFound);
+    }
     let (is_fat, rel) = split(path);
     if is_fat {
         fat32_read_path(rel).ok_or(VfsError::NotFound)
@@ -382,6 +435,9 @@ pub fn read(path: &str) -> VfsResult<Vec<u8>> {
 }
 
 pub fn write(path: &str, data: &[u8]) -> VfsResult<()> {
+    if crate::procfs::is_proc_path(path) {
+        return Err(VfsError::Io);
+    }
     let (is_fat, rel) = split(path);
     let ok = if is_fat {
         fat32_write_path(rel, data)
@@ -392,6 +448,9 @@ pub fn write(path: &str, data: &[u8]) -> VfsResult<()> {
 }
 
 pub fn exists(path: &str) -> bool {
+    if crate::procfs::is_proc_path(path) {
+        return crate::procfs::exists(path);
+    }
     let (is_fat, rel) = split(path);
     if is_fat {
         fat32_exists_path(rel)

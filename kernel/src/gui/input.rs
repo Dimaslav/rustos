@@ -14,12 +14,12 @@ use super::anim::RectOnDone;
 use super::chrome::calc_layout;
 use super::notepad;
 use super::state::*;
+use super::taskbar_layout;
 use super::theme;
 use super::Wm;
 
 const DOUBLE_CLICK_TICKS: u64 = 6;
 
-/// Высота строки в Todo. Должна совпадать с draw_todo.
 const TODO_ROW_H: usize = 28;
 
 impl Wm {
@@ -27,7 +27,6 @@ impl Wm {
         self.hover = (x, y);
         self.tooltip = None;
 
-        // --- G4: drag-n-drop файлов ---
         if let Some(df) = &mut self.drag_files {
             df.cur_x = x;
             df.cur_y = y;
@@ -44,7 +43,6 @@ impl Wm {
             }
         }
 
-        // --- Resize в процессе ---
         if let Some(rd) = &self.resize_drag {
             let idx = rd.idx;
             let dir = rd.dir;
@@ -98,8 +96,6 @@ impl Wm {
             self.dirty = true;
             return;
         }
-
-        // --- Обычное движение ---
 
         if self.drag.is_some() {
             let (sw, _sh) = mouse::screen_size();
@@ -308,7 +304,7 @@ impl Wm {
     pub(in crate::gui) fn on_left_down(&mut self, x: i32, y: i32) {
         self.dirty = true;
 
-        let (_sw, sh) = mouse::screen_size();
+        let (sw, sh) = mouse::screen_size();
         let taskbar_y = (sh as usize).saturating_sub(TASKBAR_H);
 
         if self.handle_ctx_menu_click(x, y) { return; }
@@ -340,6 +336,7 @@ impl Wm {
                             }
                             "Сменить тему" => {
                                 theme::toggle();
+                                crate::framebuffer::invalidate_background();
                                 self.anim.toast("Тема изменена", super::anim::ToastKind::Info);
                             }
                             "О системе" => {
@@ -364,16 +361,24 @@ impl Wm {
         }
 
         if (y as usize) >= taskbar_y {
-            if x < 78 {
+            let btn_h = taskbar_layout::button_h(TASKBAR_H);
+            let btn_y = taskbar_layout::button_y(taskbar_y, TASKBAR_H);
+
+            if widgets::hit(
+                x, y,
+                taskbar_layout::START_BTN_X, btn_y,
+                taskbar_layout::START_BTN_W, btn_h,
+            ) {
                 self.toggle_start_menu();
                 return;
             }
-            let mut bx = 92;
-            for idx in 0..self.windows.len() {
-                let kind = Self::app_kind_of(&self.windows[idx]);
-                let _ = kind;
-                let bw = crate::framebuffer::Writer::text_width(&self.windows[idx].title) + 24 + 22;
-                if (x as usize) >= bx && (x as usize) < bx + bw {
+
+            let titles: Vec<String> =
+                self.windows.iter().map(|wi| wi.title.clone()).collect();
+            let buttons = taskbar_layout::task_buttons(&titles, sw as usize);
+
+            for (idx, btn) in buttons.iter().enumerate() {
+                if widgets::hit(x, y, btn.x, btn_y, btn.w, btn_h) {
                     if idx == self.active && !self.windows[idx].minimized {
                         self.minimize_window(idx);
                     } else if self.windows[idx].minimized {
@@ -383,7 +388,6 @@ impl Wm {
                     }
                     return;
                 }
-                bx += bw + 6;
             }
             return;
         }
@@ -414,7 +418,6 @@ impl Wm {
             }
         }
 
-        // Resize.
         if let Some((idx, dir)) = self.detect_resize_dir(x, y) {
             let w = &self.windows[idx];
             self.resize_drag = Some(ResizeDrag {
@@ -471,7 +474,6 @@ impl Wm {
             } else {
                 self.handle_content_click(x, y);
 
-                // G4: если попали в список файлов Explorer — подготовить drag-n-drop.
                 if let App::Explorer { path, selected, .. } = &self.windows[self.active].content {
                     if !selected.is_empty() {
                         let entries = self.list_dir_entries(path);
@@ -510,14 +512,12 @@ impl Wm {
             return;
         }
 
-        // G4: drop, если drag активен.
         if let Some(df) = &self.drag_files {
             if df.active {
                 self.perform_drop(x, y);
                 self.dirty = true;
                 return;
             } else {
-                // Был лишь клик без движения — очищаем pending.
                 self.drag_files = None;
             }
         }
@@ -765,11 +765,14 @@ impl Wm {
         let (wx, wy, ww, wh) = { let win = &self.windows[idx]; (win.x.max(0) as usize, win.y.max(0) as usize, win.w, win.h) };
         let toolbar_y = wy + TITLE_H + 8;
         let body_y = toolbar_y + EXP_TOOLBAR_H + 8;
+
+        // ИСПРАВЛЕНИЕ: координаты и ширины совпадают с draw_explorer.
+        // nf_x — 96 px, fl_x = nf_x + 100, del_x = fl_x + 100.
         let back_x = wx + 10;
         let up_x = back_x + 48;
         let nf_x = up_x + 48;
-        let fl_x = nf_x + 90;
-        let del_x = fl_x + 90;
+        let fl_x = nf_x + 100;
+        let del_x = fl_x + 100;
         let ren_x = del_x + 80;
 
         let is_dialog_open = matches!(&self.windows[idx].content, App::Explorer { mode, .. } if !matches!(mode, ExplorerMode::Browse));
@@ -817,7 +820,8 @@ impl Wm {
                 self.dirty = true;
                 return;
             }
-            if widgets::hit(mx, my, nf_x, toolbar_y, 86, EXP_TOOLBAR_H) {
+            // ИСПРАВЛЕНИЕ: ширина 96 вместо 86.
+            if widgets::hit(mx, my, nf_x, toolbar_y, 96, EXP_TOOLBAR_H) {
                 let p = match &self.windows[idx].content { App::Explorer { path, .. } => path.clone(), _ => return };
                 if let App::Explorer { mode, .. } = &mut self.windows[idx].content {
                     if p.starts_with("C:") { *mode = ExplorerMode::NewFile { name: String::new() }; }
@@ -826,7 +830,7 @@ impl Wm {
                 self.dirty = true;
                 return;
             }
-            if widgets::hit(mx, my, fl_x, toolbar_y, 86, EXP_TOOLBAR_H) {
+            if widgets::hit(mx, my, fl_x, toolbar_y, 96, EXP_TOOLBAR_H) {
                 if let App::Explorer { mode, .. } = &mut self.windows[idx].content {
                     *mode = ExplorerMode::NewFile { name: String::new() };
                 }
@@ -989,7 +993,6 @@ impl Wm {
             if let App::Notepad { mode, .. } = &mut self.windows[idx].content {
                 if !matches!(mode, NotepadMode::Browse) { *mode = NotepadMode::Browse; self.dirty = true; return; }
             }
-            // G5: закрыть стартовое меню с анимацией, если открыто.
             if self.start_pressed {
                 self.close_start_menu_anim();
                 return;

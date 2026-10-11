@@ -31,7 +31,11 @@ pub fn init_heap(
         let frame = frame_allocator
             .allocate_frame()
             .ok_or(MapToError::FrameAllocationFailed)?;
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        // ИСПРАВЛЕНИЕ: heap — только для данных, NX запрещает исполнение.
+        // W^X: страница либо writable, либо executable; здесь — writable.
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
         unsafe {
             mapper.map_to(page, frame, flags, frame_allocator)?.flush();
         }

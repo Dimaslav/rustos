@@ -57,7 +57,10 @@ pub fn alloc_window(
         return None;
     }
     let id = { let mut n = NEXT_ID.lock(); let v = *n; *n += 1; v };
-    let buf_len = (w as usize) * (h as usize) * 4;
+    let buf_len = match (w as usize).checked_mul(h as usize).and_then(|v| v.checked_mul(4)) {
+        Some(v) => v,
+        None => return None,
+    };
     let fw = ForeignWindow {
         id,
         pid,
@@ -78,12 +81,11 @@ pub fn alloc_window(
 }
 
 /// Копирует user-буфер в kernel-shadow. CR3 в syscall = user-AS, поэтому
-/// по `user_buf` можно читать напрямую.
+/// по `user_buf` можно читать напрямую — но только если страницы отображены.
 ///
-/// Возвращает `false`, если окно исчезло или lock занят (main сейчас
-/// перерисовывает — тогда пропускаем кадр, следующий пройдёт).
+/// Возвращает `false`, если окно исчезло, lock занят, или user-буфер
+/// вышел за пределы user-пространства / не отображён.
 pub fn present(id: u64) -> bool {
-    // try_lock: избегаем busy-wait, если main рисует прямо сейчас.
     let mut guard = match FOREIGN.try_lock() {
         Some(g) => g,
         None => return false,
@@ -91,6 +93,18 @@ pub fn present(id: u64) -> bool {
     let Some(fw) = guard.iter_mut().find(|f| f.id == id) else {
         return false;
     };
+
+    // ИСПРАВЛЕНИЕ: раньше мы читали user_buf без проверки, что весь диапазон
+    // отображён. User мог вызвать `munmap` (сейчас — заглушка, но API есть)
+    // или дать кривой адрес. Проверяем диапазон ДО чтения.
+    if !unsafe { crate::memory::is_user_range_mapped(fw.user_buf, fw.buf_len) } {
+        crate::log_warn!(
+            "[win] present: user buffer not mapped (win {}, ptr={:#x}, len={})",
+            id, fw.user_buf, fw.buf_len
+        );
+        return false;
+    }
+
     unsafe {
         let src = fw.user_buf as *const u8;
         for i in 0..fw.buf_len {
@@ -133,8 +147,7 @@ pub fn push_event_to_pid(pid: u64, ev: WinEvent) {
 }
 
 /// Попадание мыши в foreign-окно.
-/// Возвращает `(id, buffer_x, buffer_y)`, где `buffer_x/y` — координаты
-/// в буфере user-программы (без учёта заголовка).
+/// Возвращает `(id, buffer_x, buffer_y)`.
 pub fn hit_test(mx: i32, my: i32) -> Option<(u64, i32, i32)> {
     let guard = FOREIGN.lock();
     for fw in guard.iter().rev() {
@@ -144,8 +157,6 @@ pub fn hit_test(mx: i32, my: i32) -> Option<(u64, i32, i32)> {
         let x1 = x0 + fw.w as i32;
         let y1 = y0 + fw.h as i32 + TITLE_BAR_H;
         if mx >= x0 && my >= y0 && mx < x1 && my < y1 {
-            // buffer_y = my - y0 - TITLE_BAR_H. Клик по заголовку даст
-            // отрицательный buffer_y — user-программа сама решит, что с ним делать.
             return Some((fw.id, mx - x0, my - y0 - TITLE_BAR_H));
         }
     }

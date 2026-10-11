@@ -130,6 +130,26 @@ pub fn parent_of(pid: ThreadId) -> Option<ThreadId> {
     s.threads.iter().find(|t| t.id == pid).map(|t| t.parent_id)
 }
 
+/// PML4 текущего потока (`None` — kernel-only AS).
+pub fn current_pml4() -> Option<u64> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    s.threads[s.current].pml4_phys
+}
+
+/// Обновить `pml4_phys` текущего потока и `CURRENT_CR3`.
+///
+/// Вызывается из `exec_in_place` после успешной замены AS — иначе
+/// следующий `schedule_tick` может решить, что AS не менялся, и не
+/// переписать CR3, оставив гостя с рассинхронизированным состоянием.
+pub fn replace_current_pml4(pml4: u64) {
+    CURRENT_CR3.store(pml4, Ordering::Release);
+    let mut g = SCHED.lock();
+    if let Some(s) = g.as_mut() {
+        s.threads[s.current].pml4_phys = Some(pml4);
+    }
+}
+
 pub fn exit_code_of(pid: ThreadId) -> Option<i32> {
     let g = SCHED.lock();
     let s = g.as_ref()?;
@@ -309,7 +329,6 @@ pub fn exit_current() -> ! {
 
 pub fn reap_finished() -> usize {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        // Сначала соберём id завершённых потоков, потом освободим их fd.
         let mut to_close_fds: Vec<ThreadId> = Vec::new();
         let mut g = SCHED.lock();
         let s = match g.as_mut() { Some(s) => s, None => return 0 };
@@ -318,19 +337,24 @@ pub fn reap_finished() -> usize {
         let mut reaped = 0usize;
         let mut i = 0;
         while i < s.threads.len() {
-            if s.threads[i].id != cur_id && s.threads[i].state == ThreadState::Finished {
-                let has_waiter = s.threads.iter().any(|t| t.parent_id == s.threads[i].id);
-                if has_waiter {
-                    i += 1;
-                    continue;
-                }
-                to_close_fds.push(s.threads[i].id);
-                s.threads.remove(i);
-                reaped += 1;
-            } else {
+            if s.threads[i].id == cur_id || s.threads[i].state != ThreadState::Finished {
                 i += 1;
+                continue;
             }
+            let parent_id = s.threads[i].parent_id;
+            let parent_alive = parent_id != 0
+                && s.threads.iter().any(|t| {
+                    t.id == parent_id && t.state != ThreadState::Finished
+                });
+            if parent_alive {
+                i += 1;
+                continue;
+            }
+            to_close_fds.push(s.threads[i].id);
+            s.threads.remove(i);
+            reaped += 1;
         }
+
         if let Some(pos) = s.threads.iter().position(|t| t.id == cur_id) {
             s.current = pos;
         } else {
@@ -344,8 +368,6 @@ pub fn reap_finished() -> usize {
         reaped
     })
 }
-
-// ---------- ps ----------
 
 #[derive(Clone, Copy)]
 pub struct ThreadInfo {

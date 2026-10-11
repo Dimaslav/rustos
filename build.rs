@@ -57,6 +57,8 @@ fn build_user_programs() {
     let user_dir = PathBuf::from("user");
     let target = "x86_64-unknown-none";
 
+    // ВАЖНО: без compiler-builtins-mem — mem* определены в user/src/lib.rs.
+    // Иначе символы конфликтуют.
     let status = Command::new("cargo")
         .current_dir(&user_dir)
         .args([
@@ -64,7 +66,6 @@ fn build_user_programs() {
             "--release",
             "--target", target,
             "-Zbuild-std=core,alloc,compiler_builtins",
-            "-Zbuild-std-features=compiler-builtins-mem",
         ])
         .status()
         .expect("Не удалось собрать user-программы");

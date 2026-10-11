@@ -12,19 +12,26 @@ use super::anim;
 use super::chrome::*;
 use super::icons;
 use super::state::*;
+use super::taskbar_layout;
 use super::theme;
 use super::Wm;
 
 impl Wm {
     pub(in crate::gui) fn draw(&self, w: &mut Writer) {
         let p = theme::palette();
-        if let Some(wp) = &self.wallpaper {
-            draw_wallpaper(w, wp);
-        } else {
-            w.gradient_v(0, 0, w.width, w.height, p.wallpaper_top, p.wallpaper_bottom);
-            if self.wallpaper_pattern != PatternKind::None {
-                draw_pattern_overlay(w, self.wallpaper_pattern);
+
+        if !w.bg_ready() {
+            if let Some(wp) = &self.wallpaper {
+                draw_wallpaper(w, wp);
+            } else {
+                w.gradient_v(0, 0, w.width, w.height, p.wallpaper_top, p.wallpaper_bottom);
+                if self.wallpaper_pattern != PatternKind::None {
+                    draw_pattern_overlay(w, self.wallpaper_pattern);
+                }
             }
+            w.commit_bg();
+        } else {
+            w.blit_bg();
         }
 
         let icons_arr = Self::icons();
@@ -173,8 +180,8 @@ impl Wm {
 
     fn draw_toasts(&self, w: &mut Writer) {
         let p = theme::palette();
-        let toast_w = 260usize;
-        let toast_h = 44usize;
+        let toast_w = 280usize;
+        let toast_h = 52usize;
         let gap = 8usize;
         let base_x = w.width.saturating_sub(toast_w + 16) as i32;
         let base_y = w.height.saturating_sub(TASKBAR_H + 20) as i32;
@@ -185,20 +192,23 @@ impl Wm {
             let x = (base_x + t.offset_x()) as usize;
             let y = (base_y - ((i as i32 + 1) * (toast_h + gap) as i32)) as usize;
 
-            let accent = match t.kind {
-                anim::ToastKind::Info    => p.accent,
-                anim::ToastKind::Success => Color { r: 60, g: 180, b: 90 },
-                anim::ToastKind::Warn    => p.danger,
+            let (accent, icon_kind) = match t.kind {
+                anim::ToastKind::Info    => (p.accent, ToastIcon::Info),
+                anim::ToastKind::Success => (Color { r: 60, g: 180, b: 90 }, ToastIcon::Success),
+                anim::ToastKind::Warn    => (p.danger, ToastIcon::Warn),
             };
 
-            if alpha == 255 {
-                w.fill_round_rect_aa(x, y, toast_w, toast_h, 8, p.window_bg_alt);
-                w.fill_round_rect_aa(x, y, 4, toast_h, 2, accent);
-                w.draw_text_at(x + 14, y + (toast_h - FONT_HEIGHT) / 2, &t.text, p.text, p.window_bg_alt);
-            } else {
-                w.fill_round_rect_aa(x, y, toast_w, toast_h, 8, p.window_bg_alt);
-                w.fill_round_rect_aa(x, y, 4, toast_h, 2, accent);
-                w.draw_text_at(x + 14, y + (toast_h - FONT_HEIGHT) / 2, &t.text, p.text, p.window_bg_alt);
+            w.fill_round_rect_aa(x, y, toast_w, toast_h, 10, p.window_bg_alt);
+            let icon_r = 14usize;
+            let icon_cx = x + 14 + icon_r;
+            let icon_cy = y + toast_h / 2;
+            w.fill_round_rect_aa(icon_cx - icon_r, icon_cy - icon_r, icon_r * 2, icon_r * 2, icon_r, accent);
+            draw_toast_icon(w, icon_cx, icon_cy, icon_kind);
+
+            let text_y = y + (toast_h - FONT_HEIGHT) / 2;
+            w.draw_text_at(x + 14 + icon_r * 2 + 12, text_y, &t.text, p.text, p.window_bg_alt);
+
+            if alpha < 255 {
                 let wp_color = p.wallpaper_top;
                 let inv = 255 - alpha;
                 if inv > 0 {
@@ -246,28 +256,73 @@ impl Wm {
         let ww = win.w;
         let wh = win.h;
 
+        if active {
+            let glow = p.accent;
+            for i in (1..=3usize).rev() {
+                let alpha: u8 = match i {
+                    1 => 60,
+                    2 => 30,
+                    _ => 15,
+                };
+                let gx = x.saturating_sub(i);
+                let gy = y.saturating_sub(i);
+                let gw = ww + i * 2;
+                let gh = wh + i * 2;
+                w.fill_rect_blend(gx, gy, gw, i, glow, alpha);
+                w.fill_rect_blend(gx, gy + gh - i, gw, i, glow, alpha);
+                w.fill_rect_blend(gx, gy + i, i, gh - 2 * i, glow, alpha);
+                w.fill_rect_blend(gx + gw - i, gy + i, i, gh - 2 * i, glow, alpha);
+            }
+        }
+
+        // Тени окон — с усиленным p.shadow (чистый чёрный в тёмной теме,
+        // тёмно-серый в светлой). Раньше p.shadow был близок к wallpaper
+        // по контрасту и тени сливались с фоном.
         for i in (1..=4usize).rev() {
             let alpha: u8 = match i {
-                1 => 100,
-                2 => 70,
-                3 => 45,
-                _ => 25,
+                1 => 110,
+                2 => 80,
+                3 => 50,
+                _ => 28,
             };
             w.fill_round_rect_aa_blend(x + i, y + i, ww, wh, 10, p.shadow, alpha);
         }
 
         w.fill_round_rect_aa(x, y, ww, wh, 10, p.window_bg);
 
-        let title_bg = if active { p.title_active } else { p.title_inactive };
-        let title_alpha = if active { p.title_alpha } else { 255 };
-
-        if title_alpha < 255 {
-            w.fill_round_rect_aa_blend(x, y, ww, TITLE_H + 10, 10, title_bg, title_alpha);
-            w.fill_rect(x, y + TITLE_H, ww, 10, p.window_bg);
+        let title_top = if active { p.title_active } else { p.title_inactive };
+        let title_bottom = if active {
+            darken(p.title_active, 40)
         } else {
-            w.fill_round_rect_aa(x, y, ww, TITLE_H + 10, 10, title_bg);
-            w.fill_rect(x, y + TITLE_H, ww, 10, p.window_bg);
+            darken(p.title_inactive, 30)
+        };
+
+        let title_alpha = if active { p.title_alpha } else { 255 };
+        let th = TITLE_H + 10;
+        for row in 0..th {
+            let t = if th > 1 { row as u32 } else { 0 };
+            let n = if th > 1 { (th - 1) as u32 } else { 1 };
+            let inv = n - t;
+            let c = Color {
+                r: ((title_top.r as u32 * inv + title_bottom.r as u32 * t) / n) as u8,
+                g: ((title_top.g as u32 * inv + title_bottom.g as u32 * t) / n) as u8,
+                b: ((title_top.b as u32 * inv + title_bottom.b as u32 * t) / n) as u8,
+            };
+            if row < 10 || row >= th.saturating_sub(10) {
+                if active && title_alpha < 255 {
+                    w.fill_rect_blend(x, y + row, ww, 1, c, title_alpha);
+                } else {
+                    w.fill_rect(x, y + row, ww, 1, c);
+                }
+            } else if active && title_alpha < 255 {
+                w.fill_rect_blend(x, y + row, ww, 1, c, title_alpha);
+            } else {
+                w.fill_rect(x, y + row, ww, 1, c);
+            }
         }
+        draw_corner_aa(w, x, y, 10, title_top, false);
+        draw_corner_aa(w, x + ww - 10, y, 10, title_top, true);
+        w.fill_rect(x, y + TITLE_H, ww, 10, p.window_bg);
 
         let kind = Self::app_kind_of(win);
         let (icon_kind, _icon_color) = Self::icon_for_kind(kind);
@@ -280,7 +335,7 @@ impl Wm {
             y + (TITLE_H - FONT_HEIGHT) / 2,
             &win.title,
             p.text,
-            title_bg,
+            title_top,
         );
 
         let cb_x = x + ww.saturating_sub(12 + CLOSE_BTN_W);
@@ -434,9 +489,11 @@ impl Wm {
         let toolbar_y = y + TITLE_H + 8;
         let back_x = x + 10;
         let up_x = back_x + 48;
+        // ИСПРАВЛЕНИЕ: кнопки «Папка» и «Файл» расширены (86 → 96),
+        // текст больше не центрируется поверх иконки-плюса.
         let nf_x = up_x + 48;
-        let fl_x = nf_x + 90;
-        let del_x = fl_x + 90;
+        let fl_x = nf_x + 100;
+        let del_x = fl_x + 100;
         let ren_x = del_x + 80;
 
         widgets::button_modern(w, back_x, toolbar_y, 42, EXP_TOOLBAR_H, "", p.window_bg_alt, p.text, false);
@@ -444,11 +501,33 @@ impl Wm {
         widgets::button_modern(w, up_x, toolbar_y, 42, EXP_TOOLBAR_H, "", p.window_bg_alt, p.text, false);
         draw_arrow_up(w, up_x + 14, toolbar_y + 9, p.text);
 
-        let nf_label = if on_disk { "Файл" } else { "Папка" };
-        widgets::button_modern(w, nf_x, toolbar_y, 86, EXP_TOOLBAR_H, nf_label, p.window_bg_alt, p.text, false);
-        draw_plus_icon(w, nf_x + 6, toolbar_y + 10, p.text);
-        widgets::button_modern(w, fl_x, toolbar_y, 86, EXP_TOOLBAR_H, "Файл", p.window_bg_alt, p.text, false);
-        draw_plus_icon(w, fl_x + 6, toolbar_y + 10, p.text);
+        // Кнопка «Папка»/«Файл»: плюс слева, текст справа от плюса.
+        // ИСПРАВЛЕНИЕ: раньше текст центрировался через button_modern
+        // и наезжал на плюс. Теперь рисуем иконку и текст раздельно.
+        {
+            let nf_label = if on_disk { "Файл" } else { "Папка" };
+            let bg = p.window_bg_alt;
+            w.fill_round_rect(nf_x + 1, toolbar_y + 2, 96, EXP_TOOLBAR_H, 6, p.shadow);
+            w.fill_round_rect(nf_x, toolbar_y, 96, EXP_TOOLBAR_H, 6, bg);
+            draw_plus_icon(w, nf_x + 10, toolbar_y + 10, p.text);
+            w.draw_text_at(
+                nf_x + 30,
+                toolbar_y + (EXP_TOOLBAR_H - FONT_HEIGHT) / 2,
+                nf_label, p.text, bg,
+            );
+        }
+        {
+            let bg = p.window_bg_alt;
+            w.fill_round_rect(fl_x + 1, toolbar_y + 2, 96, EXP_TOOLBAR_H, 6, p.shadow);
+            w.fill_round_rect(fl_x, toolbar_y, 96, EXP_TOOLBAR_H, 6, bg);
+            draw_plus_icon(w, fl_x + 10, toolbar_y + 10, p.text);
+            w.draw_text_at(
+                fl_x + 30,
+                toolbar_y + (EXP_TOOLBAR_H - FONT_HEIGHT) / 2,
+                "Файл", p.text, bg,
+            );
+        }
+
         widgets::button_modern(w, del_x, toolbar_y, 76, EXP_TOOLBAR_H, "", p.window_bg_alt, p.text, false);
         draw_trash_icon(w, del_x + 4, toolbar_y + 10, p.text);
         widgets::button_modern(w, ren_x, toolbar_y, 76, EXP_TOOLBAR_H, "", p.window_bg_alt, p.text, false);
@@ -704,27 +783,43 @@ impl Wm {
             w.blur_rect(0, y, w.width, TASKBAR_H, p.blur_radius);
         }
         w.fill_rect_blend(0, y, w.width, TASKBAR_H, p.taskbar_bg, p.taskbar_alpha);
+        w.fill_rect_blend(0, y - 2, w.width, 2, p.shadow, 80);
         w.fill_rect(0, y, w.width, 1, p.border);
 
-        let btn_h = TASKBAR_H.saturating_sub(14);
-        let btn_y = y + (TASKBAR_H - btn_h) / 2;
-        let start_hover = widgets::hit(self.hover.0, self.hover.1, 6, btn_y, 70, btn_h);
+        let btn_h = taskbar_layout::button_h(TASKBAR_H);
+        let btn_y = taskbar_layout::button_y(y, TASKBAR_H);
+
+        let start_hover = widgets::hit(
+            self.hover.0, self.hover.1,
+            taskbar_layout::START_BTN_X, btn_y,
+            taskbar_layout::START_BTN_W, btn_h,
+        );
         let start_active = self.start_pressed || self.menu_anim.is_some();
         let start_bg = if start_active || start_hover { p.accent } else { p.window_bg_alt };
-        widgets::button_modern(w, 6, btn_y, 70, btn_h, "Пуск", start_bg, Color::WHITE, false);
+        widgets::button_modern(
+            w,
+            taskbar_layout::START_BTN_X, btn_y,
+            taskbar_layout::START_BTN_W, btn_h,
+            "Пуск", start_bg, Color::WHITE, false,
+        );
 
-        w.fill_rect(82, y + 12, 1, TASKBAR_H.saturating_sub(24), p.border);
+        w.fill_rect(
+            taskbar_layout::SEP_X, y + 12,
+            1, TASKBAR_H.saturating_sub(24), p.border,
+        );
 
-        let mut bx = 96usize;
-        for (idx, win) in self.windows.iter().enumerate() {
+        let titles: Vec<String> = self.windows.iter().map(|wi| wi.title.clone()).collect();
+        let buttons = taskbar_layout::task_buttons(&titles, w.width);
+
+        for (idx, btn) in buttons.iter().enumerate() {
+            if idx >= self.windows.len() { break; }
+            let win = &self.windows[idx];
             let kind = Self::app_kind_of(win);
             let (icon_kind, icon_color) = Self::icon_for_kind(kind);
 
             let label = &win.title;
-            let label_w = Writer::text_width(label);
-            let bw = 14 + 16 + 8 + label_w + 14;
             let pressed = idx == self.active && !win.minimized;
-            let hover = widgets::hit(self.hover.0, self.hover.1, bx, btn_y, bw, btn_h);
+            let hover = widgets::hit(self.hover.0, self.hover.1, btn.x, btn_y, btn.w, btn_h);
             let bg = if pressed {
                 p.accent
             } else if hover {
@@ -733,23 +828,21 @@ impl Wm {
                 p.window_bg_alt
             };
 
-            w.fill_round_rect(bx + 1, btn_y + 1, bw, btn_h, 6, p.shadow);
-            w.fill_round_rect(bx, btn_y, bw, btn_h, 6, bg);
+            w.fill_round_rect(btn.x + 1, btn_y + 1, btn.w, btn_h, 6, p.shadow);
+            w.fill_round_rect(btn.x, btn_y, btn.w, btn_h, 6, bg);
 
             let icon_size = 16usize;
             let icon_y = btn_y + (btn_h.saturating_sub(icon_size)) / 2;
-            icons::draw(icon_kind, w, bx + 14, icon_y, icon_size, icon_color);
+            icons::draw(icon_kind, w, btn.x + 14, icon_y, icon_size, icon_color);
 
             let text_y = btn_y + (btn_h.saturating_sub(FONT_HEIGHT)) / 2;
-            w.draw_text_at(bx + 14 + 16 + 8, text_y, label, Color::WHITE, bg);
+            w.draw_text_at(btn.x + 14 + 16 + 8, text_y, label, Color::WHITE, bg);
 
             if pressed {
-                let pw = bw.min(40);
-                let px = bx + (bw - pw) / 2;
+                let pw = btn.w.min(40);
+                let px = btn.x + (btn.w - pw) / 2;
                 w.fill_round_rect(px, y + TASKBAR_H - 3, pw, 3, 1, p.accent_hover);
             }
-
-            bx += bw + 10;
         }
 
         let now = rtc::read_rtc();
@@ -819,8 +912,74 @@ impl Wm {
     }
 }
 
-/// Паттерн поверх градиента обоев. Рисуется очень прозрачными точками/линиями,
-/// чтобы не отвлекать от окон.
+#[derive(Clone, Copy)]
+enum ToastIcon {
+    Info,
+    Success,
+    Warn,
+}
+
+fn draw_toast_icon(w: &mut Writer, cx: usize, cy: usize, kind: ToastIcon) {
+    let white = Color::WHITE;
+    match kind {
+        ToastIcon::Info => {
+            w.fill_rect(cx - 1, cy - 7, 2, 3, white);
+            w.fill_rect(cx - 1, cy - 2, 2, 9, white);
+        }
+        ToastIcon::Success => {
+            for k in 0..6usize {
+                w.set_pixel(cx - 6 + k, cy + 1 + k / 2, white);
+                w.set_pixel(cx - 6 + k, cy + 2 + k / 2, white);
+            }
+            for k in 0..6usize {
+                w.set_pixel(cx + k - 1, cy + 4 - k, white);
+                w.set_pixel(cx + k - 1, cy + 5 - k, white);
+            }
+        }
+        ToastIcon::Warn => {
+            w.fill_rect(cx - 1, cy - 7, 2, 10, white);
+            w.fill_rect(cx - 1, cy + 5, 2, 2, white);
+        }
+    }
+}
+
+fn draw_corner_aa(w: &mut Writer, x: usize, y: usize, r: usize, color: Color, flip: bool) {
+    let rf = r as f32;
+    let cx = if flip { rf - 0.5 } else { rf - 0.5 };
+    let cy = rf - 0.5;
+    let dr = rf + 0.5;
+    let dr2 = dr * dr;
+    let r05 = rf - 0.5;
+    let r05_2 = r05 * r05;
+    let two_dr = 2.0 * dr;
+
+    for dy in 0..r {
+        for dx in 0..r {
+            let ax = if flip { (r - 1 - dx) as f32 - cx } else { dx as f32 - cx };
+            let ay = dy as f32 - cy;
+            let d2 = ax * ax + ay * ay;
+            let alpha: u8 = if d2 <= r05_2 {
+                255
+            } else if d2 >= dr2 {
+                continue;
+            } else {
+                let t = ((dr2 - d2) / two_dr) * 255.0;
+                if t <= 0.0 { continue; }
+                if t >= 255.0 { 255 } else { t as u8 }
+            };
+            w.blend_pixel(x + dx, y + dy, color, alpha);
+        }
+    }
+}
+
+fn darken(c: Color, amount: u32) -> Color {
+    Color {
+        r: c.r.saturating_sub(amount as u8),
+        g: c.g.saturating_sub(amount as u8),
+        b: c.b.saturating_sub(amount as u8),
+    }
+}
+
 fn draw_pattern_overlay(w: &mut Writer, kind: PatternKind) {
     let dot = Color { r: 255, g: 255, b: 255 };
     match kind {
@@ -831,11 +990,11 @@ fn draw_pattern_overlay(w: &mut Writer, kind: PatternKind) {
             while y < w.height {
                 let mut x = 20usize;
                 while x < w.width {
-                    w.blend_pixel(x, y, dot, 25);
-                    if x + 1 < w.width { w.blend_pixel(x + 1, y, dot, 15); }
-                    if y + 1 < w.height { w.blend_pixel(x, y + 1, dot, 15); }
+                    w.blend_pixel(x, y, dot, 40);
+                    if x + 1 < w.width { w.blend_pixel(x + 1, y, dot, 22); }
+                    if y + 1 < w.height { w.blend_pixel(x, y + 1, dot, 22); }
                     if x + 1 < w.width && y + 1 < w.height {
-                        w.blend_pixel(x + 1, y + 1, dot, 8);
+                        w.blend_pixel(x + 1, y + 1, dot, 12);
                     }
                     x += step;
                 }
@@ -846,12 +1005,12 @@ fn draw_pattern_overlay(w: &mut Writer, kind: PatternKind) {
             let step = 40usize;
             for y in (0..w.height).step_by(step) {
                 for x in 0..w.width {
-                    w.blend_pixel(x, y, dot, 12);
+                    w.blend_pixel(x, y, dot, 18);
                 }
             }
             for x in (0..w.width).step_by(step) {
                 for y in 0..w.height {
-                    w.blend_pixel(x, y, dot, 12);
+                    w.blend_pixel(x, y, dot, 18);
                 }
             }
         }
@@ -866,7 +1025,7 @@ fn draw_pattern_overlay(w: &mut Writer, kind: PatternKind) {
                 while y <= end_y {
                     let x = d - y;
                     if x < w.width {
-                        w.blend_pixel(x, y, dot, 14);
+                        w.blend_pixel(x, y, dot, 20);
                     }
                     y += 1;
                 }
@@ -881,11 +1040,11 @@ fn draw_pattern_overlay(w: &mut Writer, kind: PatternKind) {
                 let x_off = if yi % 2 == 0 { 0 } else { step / 2 };
                 let mut x = x_off + 30;
                 while x < w.width {
-                    w.blend_pixel(x, y, dot, 30);
-                    if x >= 1 { w.blend_pixel(x - 1, y, dot, 20); }
-                    if x + 1 < w.width { w.blend_pixel(x + 1, y, dot, 20); }
-                    if y >= 1 { w.blend_pixel(x, y - 1, dot, 20); }
-                    if y + 1 < w.height { w.blend_pixel(x, y + 1, dot, 20); }
+                    w.blend_pixel(x, y, dot, 45);
+                    if x >= 1 { w.blend_pixel(x - 1, y, dot, 30); }
+                    if x + 1 < w.width { w.blend_pixel(x + 1, y, dot, 30); }
+                    if y >= 1 { w.blend_pixel(x, y - 1, dot, 30); }
+                    if y + 1 < w.height { w.blend_pixel(x, y + 1, dot, 30); }
                     x += step;
                 }
                 y += step;
@@ -905,7 +1064,7 @@ fn draw_foreign(w: &mut Writer, fw: &crate::win::ForeignWindow) {
 
     for i in (1..=4usize).rev() {
         let alpha: u8 = match i {
-            1 => 100, 2 => 70, 3 => 45, _ => 25,
+            1 => 110, 2 => 80, 3 => 50, _ => 28,
         };
         w.fill_round_rect_aa_blend(x + i, y + i, ww, hh + title_h, 10, p.shadow, alpha);
     }

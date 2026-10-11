@@ -1,8 +1,26 @@
 //! Минимальный загрузчик ELF64 (little-endian, ET_EXEC или ET_DYN).
 //!
-//! Загружает PT_LOAD-сегменты в текущую page table с флагами
-//! PRESENT|WRITABLE|USER_ACCESSIBLE. Executable-бит в long mode не
-//! различается по умолчанию (NX не включён).
+//! Загружает PT_LOAD-сегменты в текущую page table.
+//!
+//! # W^X и NX
+//!
+//! Флаги страниц берутся из `p_flags` ELF-сегмента:
+//! - `R+X` → `PRESENT | USER` (RX)
+//! - `R+W` → `PRESENT | WRITABLE | USER | NO_EXECUTE` (RW+NX)
+//! - `R`   → `PRESENT | USER | NO_EXECUTE` (R, только чтение)
+//!
+//! # Двухфазный маппинг
+//!
+//! С CR0.WP=1 нельзя писать в read-only страницу даже из Ring 0.
+//! Поэтому мапим сначала **все** страницы сегмента как `RW`, заливаем
+//! содержимое, и только потом через `update_flags` ставим финальные
+//! флаги. Это единственный безопасный способ разложить .text-сегмент
+//! в свежий AS.
+//!
+//! Порядок бит `p_flags` (стандарт ELF):
+//! - бит 0 (1) = X (execute)
+//! - бит 1 (2) = W (write)
+//! - бит 2 (4) = R (read)
 
 use alloc::vec::Vec;
 
@@ -75,7 +93,7 @@ pub fn load(
             continue;
         }
 
-        let _p_flags = u32::from_le_bytes(ph[4..8].try_into().unwrap());
+        let p_flags = u32::from_le_bytes(ph[4..8].try_into().unwrap());
         let p_offset = u64::from_le_bytes(ph[8..16].try_into().unwrap()) as usize;
         let p_vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
         let p_filesz = u64::from_le_bytes(ph[32..40].try_into().unwrap()) as usize;
@@ -85,7 +103,23 @@ pub fn load(
             continue;
         }
 
-        let flags = PageTableFlags::PRESENT
+        // ELF p_flags: bit0 = X, bit1 = W, bit2 = R.
+        let executable = p_flags & 0b001 != 0;
+        let writable   = p_flags & 0b010 != 0;
+
+        // Финальные флаги (что хотим получить в итоге).
+        let mut final_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if writable {
+            final_flags.insert(PageTableFlags::WRITABLE);
+        }
+        if !executable {
+            final_flags.insert(PageTableFlags::NO_EXECUTE);
+        }
+
+        // Временные флаги: RW+USER, чтобы можно было записать содержимое
+        // без #PF. NX не ставим — на запись он не влияет, но при отладке
+        // проще видеть ровные права на время загрузки.
+        let temp_flags = PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
             | PageTableFlags::USER_ACCESSIBLE;
 
@@ -95,16 +129,18 @@ pub fn load(
         let start_page = Page::containing_address(VirtAddr::new(vstart));
         let end_page = Page::containing_address(VirtAddr::new(vend - 1));
 
+        // Фаза 1: маппим всё как RW.
         for page in Page::range_inclusive(start_page, end_page) {
             let frame = alloc.allocate_frame().ok_or(ElfError::MapFailed)?;
             unsafe {
                 mapper
-                    .map_to(page, frame, flags, alloc)
+                    .map_to(page, frame, temp_flags, alloc)
                     .map_err(|_| ElfError::MapFailed)?
                     .flush();
             }
         }
 
+        // Фаза 2: заливаем содержимое.
         if p_filesz > 0 {
             if p_offset + p_filesz > data.len() {
                 return Err(ElfError::BadOffset);
@@ -125,7 +161,20 @@ pub fn load(
             }
         }
 
-        segments.push((vstart, vend, flags));
+        // Фаза 3: применяем финальные флаги.
+        //
+        // update_flags работает только с 4-KiB страницами; у нас все
+        // страницы 4-KiB, поэтому конфликтов не будет.
+        for page in Page::range_inclusive(start_page, end_page) {
+            unsafe {
+                mapper
+                    .update_flags(page, final_flags)
+                    .map_err(|_| ElfError::MapFailed)?
+                    .flush();
+            }
+        }
+
+        segments.push((vstart, vend, final_flags));
     }
 
     let mut entry_ok = false;

@@ -40,6 +40,14 @@ pub fn create() -> Option<u32> {
     Some(id)
 }
 
+/// ИСПРАВЛЕНИЕ: раньше `read`/`write` возвращали `None` и при «нет данных,
+/// writer жив», и при «нет такого pipe». Второе превращалось в вечный цикл
+/// `yield_now()` в syscall'е. Теперь `is_alive` позволяет их различить.
+pub fn is_alive(pipe_id: u32) -> bool {
+    let p = PIPES.lock();
+    p.iter().any(|x| x.id == pipe_id && x.alive)
+}
+
 pub fn read(pipe_id: u32, buf: &mut [u8]) -> Option<usize> {
     let mut p = PIPES.lock();
     let pipe = p.iter_mut().find(|x| x.id == pipe_id && x.alive)?;

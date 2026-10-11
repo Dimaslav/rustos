@@ -24,11 +24,8 @@ pub struct FatEntry {
     pub kind: FatKind,
     pub size: u32,
     pub first_cluster: u32,
-    /// LBA сектора, где начинается short-entry.
     pub dir_offset: u32,
-    /// Смещение внутри сектора для short-entry.
     pub entry_off: usize,
-    /// Сколько LFN-записей стоит **перед** short-entry (0 — только short).
     pub lfn_count: usize,
 }
 
@@ -120,23 +117,40 @@ impl Fat32 {
         self.data_start_lba() + (cluster - 2) * self.sectors_per_cluster as u32
     }
 
+    /// Определить кластер каталога по LBA его короткой записи.
+    ///
+    /// ИСПРАВЛЕНИЕ: раньше `rename` всегда использовал `root_cluster` и
+    /// «вырезал» файл в корень. Теперь по `dir_offset` (= LBA short-entry)
+    /// вычисляется реальный кластер каталога.
+    fn cluster_for_dir_lba(&self, lba: u32) -> Option<u32> {
+        let data_start = self.data_start_lba();
+        if lba < data_start {
+            return None;
+        }
+        let spc = self.sectors_per_cluster as u32;
+        if spc == 0 {
+            return None;
+        }
+        Some(2 + (lba - data_start) / spc)
+    }
+
     // ---------- FAT ----------
 
-    fn fat_next(&mut self, cluster: u32) -> u32 {
+    /// ИСПРАВЛЕНИЕ: возвращает `None` при ошибке I/O, чтобы вызывающий
+    /// код не путал её с концом цепочки (`FAT_EOC`).
+    fn fat_next(&mut self, cluster: u32) -> Option<u32> {
         let fat_offset = cluster * 4;
         let sector_in_fat = fat_offset / SECTOR_SIZE as u32;
         let offset_in_sector = (fat_offset % SECTOR_SIZE as u32) as usize;
         let lba = self.fat_start_lba() + sector_in_fat;
-        let Some(sector) = self.drive.read_sector(lba) else {
-            return FAT_EOC;
-        };
+        let sector = self.drive.read_sector(lba)?;
         let val = u32::from_le_bytes([
             sector[offset_in_sector],
             sector[offset_in_sector + 1],
             sector[offset_in_sector + 2],
             sector[offset_in_sector + 3],
         ]);
-        val & 0x0FFF_FFFF
+        Some(val & 0x0FFF_FFFF)
     }
 
     fn fat_set(&mut self, cluster: u32, value: u32) -> bool {
@@ -197,7 +211,10 @@ impl Fat32 {
         let mut guard = 0u32;
         while cluster >= 2 && cluster < 0x0FFF_FFF8 && guard < 1_000_000 {
             guard += 1;
-            let next = self.fat_next(cluster);
+            let next = match self.fat_next(cluster) {
+                Some(n) => n,
+                None => return false,
+            };
             if !self.fat_set(cluster, 0) {
                 return false;
             }
@@ -280,7 +297,10 @@ impl Fat32 {
                     return out;
                 }
             }
-            let next = self.fat_next(cluster);
+            let next = match self.fat_next(cluster) {
+                Some(n) => n,
+                None => break,
+            };
             if next == cluster || next >= 0x0FFF_FFF8 {
                 break;
             }
@@ -419,7 +439,10 @@ impl Fat32 {
             for s in 0..spc {
                 sector_lbas.push(lba + s);
             }
-            let next = self.fat_next(c);
+            let next = match self.fat_next(c) {
+                Some(n) => n,
+                None => break,
+            };
             if next == c || next >= 0x0FFF_FFF8 {
                 break;
             }
@@ -524,7 +547,10 @@ impl Fat32 {
             for s in 0..spc {
                 chain_lbas.push(lba0 + s);
             }
-            let next = self.fat_next(cluster);
+            let next = match self.fat_next(cluster) {
+                Some(n) => n,
+                None => break,
+            };
             if next == cluster || next >= 0x0FFF_FFF8 {
                 break;
             }
@@ -599,7 +625,10 @@ impl Fat32 {
                 }
             }
 
-            let next = self.fat_next(cluster);
+            let next = match self.fat_next(cluster) {
+                Some(n) => n,
+                None => return Err(FatError::Io),
+            };
             if next == cluster || next >= 0x0FFF_FFF8 {
                 let new_c = self.allocate_chain(1).ok_or(FatError::NoSpace)?;
                 let zeros = vec![0u8; csize];
@@ -722,15 +751,25 @@ impl Fat32 {
 
     // ---------- Запись файла ----------
 
+    /// ИСПРАВЛЕНИЕ: сначала пишем в новую цепочку, только при успехе
+    /// трогаем старую. Раньше при `NoSpace` старый файл уже был потерян.
     pub fn write_file(&mut self, entry: &mut FatEntry, data: &[u8]) -> FatResult<()> {
-        if entry.first_cluster >= 2 {
-            self.free_chain(entry.first_cluster);
-        }
+        let old_first = entry.first_cluster;
+        let old_size = entry.size;
 
+        // Особый случай: пустые данные.
         if data.is_empty() {
             entry.first_cluster = 0;
             entry.size = 0;
-            self.update_dir_entry(entry)?;
+            if let Err(e) = self.update_dir_entry(entry) {
+                // Откат в памяти.
+                entry.first_cluster = old_first;
+                entry.size = old_size;
+                return Err(e);
+            }
+            if old_first >= 2 {
+                self.free_chain(old_first);
+            }
             return Ok(());
         }
 
@@ -738,6 +777,7 @@ impl Fat32 {
         let need = (data.len() as u32 + csize - 1) / csize;
         let first = self.allocate_chain(need).ok_or(FatError::NoSpace)?;
 
+        // Записываем данные.
         let mut cluster = first;
         let mut written = 0usize;
         let mut guard = 0u32;
@@ -747,18 +787,41 @@ impl Fat32 {
             let mut chunk = vec![0u8; csize as usize];
             let take = (data.len() - written).min(csize as usize);
             chunk[..take].copy_from_slice(&data[written..written + take]);
-            self.write_cluster(cluster, &chunk);
+            if !self.write_cluster(cluster, &chunk) {
+                // Не записали — освобождаем только что выделенную цепочку.
+                self.free_chain(first);
+                return Err(FatError::Io);
+            }
             written += take;
-            let next = self.fat_next(cluster);
+            let next = match self.fat_next(cluster) {
+                Some(n) => n,
+                None => {
+                    self.free_chain(first);
+                    return Err(FatError::Io);
+                }
+            };
             if next == cluster || next >= 0x0FFF_FFF8 {
                 break;
             }
             cluster = next;
         }
 
+        // Публикуем в dir-entry.
         entry.first_cluster = first;
         entry.size = data.len() as u32;
-        self.update_dir_entry(entry)?;
+        if let Err(e) = self.update_dir_entry(entry) {
+            // Не удалось обновить метаданные — откатываем в памяти,
+            // освобождаем только что выделенную цепочку, старую не трогаем.
+            self.free_chain(first);
+            entry.first_cluster = old_first;
+            entry.size = old_size;
+            return Err(e);
+        }
+
+        // Только теперь можно отпустить старую цепочку.
+        if old_first >= 2 {
+            self.free_chain(old_first);
+        }
         Ok(())
     }
 
@@ -872,14 +935,19 @@ impl Fat32 {
     ///   4. записать новые записи;
     ///   5. только после успеха — пометить старые как удалённые.
     ///
-    /// Ограничение MVP: поиск коллизий и свободных слотов идёт в корне.
+    /// ИСПРАВЛЕНИЕ: теперь работаем в родительском каталоге (вычисляется по
+    /// `entry.dir_offset`), а не всегда в корне. Раньше файл «переезжал» в root.
     pub fn rename(&mut self, entry: &FatEntry, new_name: &str) -> FatResult<()> {
         if !valid_name(new_name) {
             return Err(FatError::InvalidName);
         }
 
+        let dir_cluster = self
+            .cluster_for_dir_lba(entry.dir_offset)
+            .ok_or(FatError::Io)?;
+
         if entry.name != new_name
-            && self.find_in_dir(self.root_cluster, new_name).is_some()
+            && self.find_in_dir(dir_cluster, new_name).is_some()
         {
             return Err(FatError::AlreadyExists);
         }
@@ -896,7 +964,6 @@ impl Fat32 {
         }
         let attr = old_sector[old_off + 11];
 
-        let dir_cluster = self.root_cluster;
         let (short_entry_template, lfn_entries) =
             self.build_short_and_lfn(dir_cluster, new_name)?;
         let total_new = lfn_entries.len() + 1;
@@ -951,7 +1018,8 @@ impl Fat32 {
         let mut buf = vec![0u8; self.cluster_size_bytes() as usize];
         write_dot_entries(&mut buf, new_c, parent_cluster);
         self.write_cluster(new_c, &buf);
-        self.fat_set(new_c, FAT_EOC);
+        // ИСПРАВЛЕНИЕ: убран redundant `fat_set(new_c, FAT_EOC)` —
+        // allocate_chain уже ставит EOC.
 
         let (short_entry, lfn_entries) =
             self.build_short_and_lfn(parent_cluster, name)?;
@@ -990,10 +1058,6 @@ impl Fat32 {
 
     // ---------- Path-based helpers ----------
 
-    /// Разобрать путь от корня, вернуть `FatEntry` последнего компонента.
-    /// Корень (`""`, `"/"`, `"C:"`) → `None` (у корня нет FatEntry).
-    ///
-    /// Поддерживает только спуск, без `..` — см. ограничение MVP.
     pub fn resolve_path(&mut self, path: &str) -> Option<FatEntry> {
         let cleaned = path
             .trim_start_matches("C:")
@@ -1027,10 +1091,6 @@ impl Fat32 {
         None
     }
 
-    /// Кластер родительского каталога для `path`:
-    /// - `/foo/bar.txt` → кластер `foo`
-    /// - `bar.txt`      → root_cluster
-    /// - `""`, `"/"`    → root_cluster
     pub fn parent_cluster_of(&mut self, path: &str) -> Option<u32> {
         let cleaned = path
             .trim_start_matches("C:")
@@ -1054,7 +1114,6 @@ impl Fat32 {
         Some(parent.first_cluster)
     }
 
-    /// Листинг каталога по пути. `""`, `"/"`, `"C:"` → корень.
     pub fn list_dir_by_path(&mut self, path: &str) -> Vec<FatEntry> {
         let cleaned = path
             .trim_start_matches("C:")
@@ -1069,7 +1128,6 @@ impl Fat32 {
         }
     }
 
-    /// Прочитать файл по пути.
     pub fn read_file_by_path(&mut self, path: &str) -> Option<Vec<u8>> {
         let entry = self.resolve_path(path)?;
         if entry.kind != FatKind::File {
@@ -1078,7 +1136,6 @@ impl Fat32 {
         Some(self.read_file(&entry))
     }
 
-    /// Записать файл по пути. Если файла нет — создать в родителе.
     pub fn write_file_by_path(&mut self, path: &str, data: &[u8]) -> bool {
         let cleaned = path
             .trim_start_matches("C:")
@@ -1111,7 +1168,6 @@ impl Fat32 {
         }
     }
 
-    /// `mkdir` по пути.
     pub fn mkdir_by_path(&mut self, path: &str) -> bool {
         let cleaned = path
             .trim_start_matches("C:")
@@ -1131,7 +1187,6 @@ impl Fat32 {
         self.mkdir(parent, name).is_ok()
     }
 
-    /// Удалить файл/пустой каталог по пути.
     pub fn remove_by_path(&mut self, path: &str) -> bool {
         let entry = match self.resolve_path(path) {
             Some(e) => e,
@@ -1140,7 +1195,6 @@ impl Fat32 {
         self.remove(&entry).is_ok()
     }
 
-    /// Переименовать по пути.
     pub fn rename_by_path(&mut self, old: &str, new_name: &str) -> bool {
         let entry = match self.resolve_path(old) {
             Some(e) => e,
@@ -1149,7 +1203,6 @@ impl Fat32 {
         self.rename(&entry, new_name).is_ok()
     }
 
-    /// Метаданные по пути: `(size, is_dir)`.
     pub fn stat_by_path(&mut self, path: &str) -> Option<(u64, bool)> {
         let entry = self.resolve_path(path)?;
         Some((entry.size as u64, entry.kind == FatKind::Directory))

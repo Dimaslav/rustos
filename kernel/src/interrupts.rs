@@ -119,18 +119,36 @@ extern "x86-interrupt" fn double_fault_handler(
     }
 }
 
+/// Page fault обрабатывается по двум принципиально разным сценариям.
+///
+/// - **User fault** (`USER_MODE` установлен): поток Ring 3 задел что-то
+///   недозволенное (stack overflow в guard-страницу, обращение к unmapped
+///   адресу, запись в RX-сегмент и т.п.). Логируем и корректно убиваем
+///   только этот поток через `sched::exit_current()`.
+///
+/// - **Kernel fault** (`USER_MODE` снят): баг ядра. Логируем, печатаем
+///   полный дамп и останавливаемся — продолжать нельзя, состояние ядра
+///   неопределено.
+///
+/// Перед чтением `[user_rsp]` обязательно проверяем, что диапазон реально
+/// отображён в текущем AS. Иначе получим вложенный fault → double fault.
 extern "x86-interrupt" fn page_fault_handler(
     sf: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    let addr = Cr2::read();
+    // ИСПРАВЛЕНИЕ: в x86_64 0.15 `Cr2::read()` возвращает
+    // `Result<VirtAddr, VirtAddrNotValid>`. Для логирования каноничность
+    // неважна, поэтому берём сырое u64 через `read_raw()`.
+    let addr_raw: u64 = Cr2::read_raw();
+    let addr: VirtAddr = VirtAddr::new_truncate(addr_raw);
+
     let protection = error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
     let write = error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
     let user = error_code.contains(PageFaultErrorCode::USER_MODE);
     let instr = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
 
     crate::log_error!("EXCEPTION: PAGE FAULT");
-    crate::log_error!("  addr:       {:?}", addr);
+    crate::log_error!("  addr:       {:#x} (raw {:#x})", addr.as_u64(), addr_raw);
     crate::log_error!("  protection: {}", protection);
     crate::log_error!("  write:      {}", write);
     crate::log_error!("  user:       {}", user);
@@ -138,21 +156,60 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::log_error!("  rip:        {:?}", sf.instruction_pointer);
 
     if user {
-        // User-поток упал. Убиваем его — kernel продолжает работу.
-        // Это изоляция: падение user-программы не вешает GUI.
-        crate::log_warn!("[fault] killing user thread");
+        handle_user_fault(&sf, addr);
+    } else {
+        handle_kernel_fault(&sf, addr, protection, write, instr);
+    }
+}
 
-        // Восстанавливаем нормальный kernel CR3 (на случай, если fault
-        // произошёл в user-AS, и мы сейчас на user-таблицах).
-        // Scheduler сам подставит нужный CR3 при следующем switch.
+/// User-mode page fault: печатаем контекст, убиваем текущий поток.
+fn handle_user_fault(sf: &InterruptStackFrame, addr: VirtAddr) -> ! {
+    // В Ring 3 `sf.stack_pointer` содержит сохранённый user RSP из iretq-фрейма
+    // (не kernel RSP обработчика).
+    let user_rsp = sf.stack_pointer.as_u64();
+    crate::log_error!("  user_rsp:   {:#x}", user_rsp);
 
-        crate::sched::exit_current();
+    unsafe {
+        if user_rsp >= 0x1000
+            && user_rsp < crate::memory::USER_ADDR_MAX
+            && crate::memory::is_user_range_mapped(user_rsp, 8)
+        {
+            let ret_addr = core::ptr::read_volatile(user_rsp as *const u64);
+            crate::log_error!("  [user_rsp]: {:#x}  <-- return address", ret_addr);
+
+            for k in 1..4usize {
+                let p = user_rsp + (k as u64) * 8;
+                if !crate::memory::is_user_range_mapped(p, 8) {
+                    break;
+                }
+                let v = core::ptr::read_volatile(p as *const u64);
+                crate::log_error!("  [+{:#x}]:  {:#x}", k * 8, v);
+            }
+        } else {
+            crate::log_error!("  [user_rsp] not mapped — пропускаю дамп стека");
+        }
     }
 
-    // Kernel fault — аварийная остановка.
+    crate::log_warn!("[fault] killing user thread at addr {:#x}", addr.as_u64());
+    crate::sched::exit_current();
+}
+
+/// Kernel-mode page fault: баг ядра, продолжать нельзя.
+fn handle_kernel_fault(
+    sf: &InterruptStackFrame,
+    addr: VirtAddr,
+    protection: bool,
+    write: bool,
+    instr: bool,
+) -> ! {
+    crate::log_error!("!!! KERNEL PAGE FAULT — баг ядра !!!");
+    crate::log_error!(
+        "  addr={:#x} prot={} write={} instr={}",
+        addr.as_u64(), protection, write, instr
+    );
     crate::log_error!("{:#?}", sf);
     println!(
-        "EXCEPTION: PAGE FAULT addr={:?} w={} p={}",
+        "EXCEPTION: KERNEL PAGE FAULT addr={:?} w={} p={}",
         addr, write, protection
     );
     loop {
@@ -179,7 +236,6 @@ extern "x86-interrupt" fn timer_handler(_sf: InterruptStackFrame) {
     TICKS.fetch_add(1, Ordering::Relaxed);
     crate::task::sleep::wake_expired();
 
-    // EOI до context switch: PIC не должен ждать, пока мы вернёмся.
     unsafe {
         PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET);
     }

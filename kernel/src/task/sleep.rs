@@ -1,4 +1,11 @@
 //! Future, завершающийся по достижении указанного тика.
+//!
+//! # IRQ-safety
+//!
+//! `wake_expired()` вызывается из timer IRQ, а `poll()` — из главного цикла
+//! с включёнными прерываниями. Чтобы они не ловили взаимный spin на
+//! `SLEEPERS`, **все** обращения к нему идут под `without_interrupts`.
+//! Из IRQ-контекста это no-op (флаг уже снят), так что вложенность безопасна.
 
 use alloc::vec::Vec;
 use core::future::Future;
@@ -10,23 +17,33 @@ use spin::Mutex;
 use crate::interrupts::ticks;
 
 struct Sleeper {
+    id: u64,
     deadline: u64,
     waker: Option<Waker>,
 }
 
 static SLEEPERS: Mutex<Vec<Sleeper>> = Mutex::new(Vec::new());
-static GENERATION: AtomicU64 = AtomicU64::new(0);
+static NEXT_SLEEPER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Общий вход в SLEEPERS с запретом прерываний.
+fn with_sleepers<R>(f: impl FnOnce(&mut Vec<Sleeper>) -> R) -> R {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut g = SLEEPERS.lock();
+        f(&mut g)
+    })
+}
 
 pub struct Sleep {
+    id: u64,
     deadline: u64,
     registered: bool,
 }
 
 impl Sleep {
     pub fn new_ms(ms: u64) -> Self {
-        // PIT ~18.2 Гц → 1 сек ≈ 18 тиков. ms → ticks: ms * 18 / 1000.
         let dticks = (ms * 18 / 1000).max(1);
         Self {
+            id: NEXT_SLEEPER_ID.fetch_add(1, Ordering::Relaxed),
             deadline: ticks() + dticks,
             registered: false,
         }
@@ -42,25 +59,32 @@ impl Future for Sleep {
             return Poll::Ready(());
         }
 
-        if !self.registered {
-            let mut s = SLEEPERS.lock();
-            s.push(Sleeper {
-                deadline: self.deadline,
-                waker: Some(cx.waker().clone()),
-            });
-            self.registered = true;
-            GENERATION.fetch_add(1, Ordering::Relaxed);
-        } else {
-            // Обновляем waker, если он изменился.
-            let mut s = SLEEPERS.lock();
-            for sl in s.iter_mut() {
-                if sl.deadline == self.deadline {
-                    sl.waker = Some(cx.waker().clone());
-                    break;
-                }
-            }
-        }
+        let id = self.id;
+        let deadline = self.deadline;
+        let registered = self.registered;
+        let waker = cx.waker().clone();
 
+        with_sleepers(|s| {
+            if !registered {
+                // ИСПРАВЛЕНИЕ: было `waker`, теперь `waker: Some(waker)`.
+                s.push(Sleeper { id, deadline, waker: Some(waker) });
+            } else {
+                for sl in s.iter_mut() {
+                    if sl.id == id {
+                        sl.waker = Some(waker);
+                        return;
+                    }
+                }
+                // Не нашли — например, deadline уже наступил и wake_expired
+                // удалил запись, но ticks() в начале poll показал < deadline
+                // из-за гонки. Регистрируем заново.
+                s.push(Sleeper { id, deadline, waker: None });
+            }
+        });
+
+        if !self.registered {
+            self.registered = true;
+        }
         Poll::Pending
     }
 }
@@ -69,8 +93,7 @@ impl Future for Sleep {
 pub fn wake_expired() {
     let now = ticks();
     let mut to_wake: Vec<Waker> = Vec::new();
-    {
-        let mut s = SLEEPERS.lock();
+    with_sleepers(|s| {
         let mut i = 0;
         while i < s.len() {
             if s[i].deadline <= now {
@@ -82,9 +105,8 @@ pub fn wake_expired() {
                 i += 1;
             }
         }
-    }
+    });
     for w in to_wake {
         w.wake();
     }
-    let _ = GENERATION.load(Ordering::Relaxed);
 }

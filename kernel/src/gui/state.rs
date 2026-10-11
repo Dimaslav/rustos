@@ -2,16 +2,12 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use spin::Once;
 
 pub const TITLE_H: usize = 30;
 pub const TASKBAR_H: usize = 48;
 pub const CLOSE_BTN_W: usize = 26;
 pub const MIN_BTN_W: usize = 26;
-
-/// Сетка иконок рабочего стола — под 1920×1080.
-pub const ICON_X: usize = 60;
-pub const ICON_Y: usize = 60;
-pub const ICON_STEP: usize = 130;
 
 pub const EXP_TOOLBAR_H: usize = 38;
 pub const EXP_ROW_H: usize = 32;
@@ -36,6 +32,62 @@ pub const START_MENU_H: usize = 300;
 pub const RESIZE_EDGE: i32 = 6;
 pub const MENU_ANIM_TICKS: u64 = 8;
 pub const DND_THRESHOLD: i32 = 5;
+
+// ---------- Адаптивный layout ----------
+
+pub struct Layout {
+    pub fb_w: usize,
+    pub fb_h: usize,
+    pub icon_x: usize,
+    pub icon_y: usize,
+    pub icon_step_x: usize,
+    pub icon_step_y: usize,
+    pub icon_cols: usize,
+    // Размеры окон.
+    pub explorer_w: usize,
+    pub explorer_h: usize,
+    pub app_w: usize,
+    pub app_h: usize,
+    pub win_offset: i32,
+}
+
+static LAYOUT: Once<Layout> = Once::new();
+
+/// Инициализируется один раз — при старте GUI.
+pub fn init_layout(fb_w: usize, fb_h: usize) {
+    LAYOUT.call_once(|| {
+        let full_hd = fb_w >= 1600 && fb_h >= 900;
+
+        let icon_cols = if full_hd { 5 } else { 4 };
+        let icon_step_x = if full_hd { 130 } else { 110 };
+        let icon_step_y = if full_hd { 105 } else { 90 };
+        let icon_x = if full_hd { 60 } else { 32 };
+        let icon_y = if full_hd { 60 } else { 32 };
+
+        // Explorer ~62% ширины и ~75% высоты, остальное — 40% / 50%.
+        let explorer_w = ((fb_w * 62) / 100).max(640);
+        let explorer_h = ((fb_h * 75) / 100).max(400);
+        let app_w = ((fb_w * 42) / 100).max(500);
+        let app_h = ((fb_h * 55) / 100).max(340);
+        let win_offset = if full_hd { 40 } else { 28 };
+
+        Layout {
+            fb_w, fb_h,
+            icon_x, icon_y,
+            icon_step_x, icon_step_y,
+            icon_cols,
+            explorer_w, explorer_h,
+            app_w, app_h,
+            win_offset,
+        }
+    });
+}
+
+pub fn layout() -> &'static Layout {
+    LAYOUT.get().expect("layout не инициализирован")
+}
+
+// ---------- Остальные типы ----------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SnapZone {

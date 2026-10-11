@@ -43,25 +43,38 @@ fn which_qemu() -> &'static str {
     std::process::exit(1);
 }
 
+/// Интерактивный запуск: WHPX + kernel-irqchip=off.
+///
+/// `kernel-irqchip=off` — обходной путь для известного бага, при котором
+/// VGA не инициализируется с WHPX (гость показывает
+/// "Guest has not initialized the display"). Всё ускорение остаётся.
 fn run_interactive(bios_path: &str, disk_path: &str) {
     let qemu = which_qemu();
     let status = Command::new(qemu)
         .args([
             "-m", "512M",
+
+            // WHPX + kernel-irqchip=off. Это обходной путь для известного
+            // бага, при котором VGA-адаптер не инициализируется, пока
+            // эмуляция контроллера прерываний находится в ядре (KVM/WHPX).
+            "-accel", "whpx,kernel-irqchip=off",
+            "-cpu", "max",
+
             "-drive", &format!("format=raw,file={}", bios_path),
             "-drive", &format!("format=raw,file={},if=ide,index=1,media=disk", disk_path),
             "-serial", "stdio",
             "-no-reboot",
             "-no-shutdown",
-            // VGA с расширенной памятью + EDID 1920x1080.
-            // Через -global, а не -device: QEMU 11.x корректно применяет
-            // эти свойства к дефолтному VGA, даже если создаётся -vga std.
+
             "-vga", "std",
             "-global", "VGA.vgamem_mb=64",
             "-global", "VGA.edid=on",
-            "-global", "VGA.xres=1920",
-            "-global", "VGA.yres=1080",
-            "-display", "gtk,zoom-to-fit=on",
+            "-global", "VGA.xres=1280",
+            "-global", "VGA.yres=720",
+
+            // Без zoom-to-fit=on — он включает CPU-скейлинг поверх
+            // framebuffer'а и заметно тормозит даже с WHPX.
+            "-display", "gtk",
         ])
         .status()
         .expect("QEMU не запустился");
@@ -71,6 +84,41 @@ fn run_interactive(bios_path: &str, disk_path: &str) {
     }
 }
 
+/// Fallback без аппаратного ускорения — на случай если WHPX недоступен.
+/// Многопоточный TCG в разы быстрее однопоточного, но всё равно
+/// заметно медленнее WHPX.
+#[allow(dead_code)]
+fn run_interactive_tcg(bios_path: &str, disk_path: &str) {
+    let qemu = which_qemu();
+    let status = Command::new(qemu)
+        .args([
+            "-m", "512M",
+            "-accel", "tcg,thread=multi",
+            "-cpu", "max",
+            "-drive", &format!("format=raw,file={}", bios_path),
+            "-drive", &format!("format=raw,file={},if=ide,index=1,media=disk", disk_path),
+            "-serial", "stdio",
+            "-no-reboot",
+            "-no-shutdown",
+            "-vga", "std",
+            "-global", "VGA.vgamem_mb=64",
+            "-global", "VGA.edid=on",
+            "-global", "VGA.xres=1280",
+            "-global", "VGA.yres=720",
+            "-display", "gtk",
+        ])
+        .status()
+        .expect("QEMU не запустился");
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// Headless-запуск для smoke-тестов.
+///
+/// Использует TCG, а не WHPX: в headless-режиме (без дисплея) WHPX
+/// падает с "Unexpected VP exit code 4". Тестам скорость не важна.
 fn run_headless(bios_path: &str, disk_path: &str) {
     let qemu = which_qemu();
     let log = "serial.log";
@@ -79,6 +127,8 @@ fn run_headless(bios_path: &str, disk_path: &str) {
     let mut cmd = Command::new(qemu);
     cmd.args([
         "-m", "512M",
+        "-accel", "tcg,thread=multi",
+        "-cpu", "max",
         "-drive", &format!("format=raw,file={}", bios_path),
         "-serial", &format!("file:{}", log),
         "-display", "none",
@@ -96,7 +146,7 @@ fn run_headless(bios_path: &str, disk_path: &str) {
     eprintln!("[test] запускаю QEMU headless (timeout=30s)");
     let mut child = cmd.spawn().expect("QEMU не запустился");
 
-    let timeout = Duration::from_secs(30);
+    let timeout = Duration::from_secs(60);
     let start = Instant::now();
     loop {
         match child.try_wait() {

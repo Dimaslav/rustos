@@ -13,6 +13,8 @@ pub const FONT_HEIGHT: usize = 16;
 pub const CURSOR_W: i32 = 12;
 pub const CURSOR_H: i32 = 19;
 
+const CURSOR_BUF_MAX: usize = 40;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
@@ -47,7 +49,12 @@ fn blend(fg: Color, bg: Color, alpha: u8) -> Color {
 
 pub struct Writer {
     back: Vec<u8>,
-    scene: Vec<u8>,
+    cursor_bg: Vec<u8>,
+    cursor_bg_pos: Option<(i32, i32)>,
+    cursor_bg_w: usize,
+    cursor_bg_h: usize,
+    bg: Vec<u8>,
+    bg_ready: bool,
     screen: &'static mut [u8],
     pub width: usize,
     pub height: usize,
@@ -57,8 +64,7 @@ pub struct Writer {
     pub cursor_x: usize,
     pub cursor_y: usize,
     pub fg: Color,
-    pub bg: Color,
-    last_cursor: Option<(i32, i32)>,
+    pub bg_color: Color,
 }
 
 impl Writer {
@@ -71,9 +77,15 @@ impl Writer {
         format: PixelFormat,
     ) -> Self {
         let buf_len = stride * height * bpp;
+        let cursor_buf_len = CURSOR_BUF_MAX * CURSOR_BUF_MAX * bpp;
         Self {
             back: vec![0u8; buf_len],
-            scene: vec![0u8; buf_len],
+            cursor_bg: vec![0u8; cursor_buf_len],
+            cursor_bg_pos: None,
+            cursor_bg_w: 0,
+            cursor_bg_h: 0,
+            bg: vec![0u8; buf_len],
+            bg_ready: false,
             screen,
             width,
             height,
@@ -83,9 +95,26 @@ impl Writer {
             cursor_x: 0,
             cursor_y: 0,
             fg: Color::TEXT,
-            bg: Color::FACE,
-            last_cursor: None,
+            bg_color: Color::FACE,
         }
+    }
+
+    pub fn bg_ready(&self) -> bool { self.bg_ready }
+
+    pub fn commit_bg(&mut self) {
+        let len = self.bg.len().min(self.back.len());
+        self.bg[..len].copy_from_slice(&self.back[..len]);
+        self.bg_ready = true;
+    }
+
+    pub fn blit_bg(&mut self) {
+        if !self.bg_ready { return; }
+        let len = self.back.len().min(self.bg.len());
+        self.back[..len].copy_from_slice(&self.bg[..len]);
+    }
+
+    pub fn invalidate_bg(&mut self) {
+        self.bg_ready = false;
     }
 
     pub fn flush_all(&mut self) {
@@ -107,22 +136,8 @@ impl Writer {
         }
     }
 
-    fn copy_rect_from_scene(&mut self, x: i32, y: i32, w: i32, h: i32) {
-        let x0 = x.max(0) as usize;
-        let y0 = y.max(0) as usize;
-        let x1 = ((x + w).min(self.width as i32)).max(0) as usize;
-        let y1 = ((y + h).min(self.height as i32)).max(0) as usize;
-        if x0 >= x1 || y0 >= y1 { return; }
-        for yy in y0..y1 {
-            let off = yy * self.stride * self.bpp + x0 * self.bpp;
-            let len = (x1 - x0) * self.bpp;
-            self.back[off..off + len].copy_from_slice(&self.scene[off..off + len]);
-        }
-    }
-
     pub fn end_scene(&mut self) {
-        self.scene.copy_from_slice(&self.back);
-        self.last_cursor = None;
+        self.cursor_bg_pos = None;
     }
 
     pub fn move_cursor(
@@ -133,12 +148,39 @@ impl Writer {
         cw: i32,
         ch: i32,
     ) -> ((i32, i32, i32, i32), (i32, i32, i32, i32)) {
-        let old_rect = if let Some((ox, oy)) = self.last_cursor {
-            self.copy_rect_from_scene(ox - 1, oy - 1, cw + 2, ch + 2);
-            (ox - 1, oy - 1, cw + 2, ch + 2)
+        let bw = (cw as usize + 4).min(CURSOR_BUF_MAX);
+        let bh = (ch as usize + 4).min(CURSOR_BUF_MAX);
+
+        let old_rect = if let Some((ox, oy)) = self.cursor_bg_pos {
+            self.restore_cursor_bg(ox, oy);
+            (ox - 2, oy - 2, self.cursor_bg_w as i32, self.cursor_bg_h as i32)
         } else {
             (0, 0, 0, 0)
         };
+
+        let sx = (mx - 2).max(0) as usize;
+        let sy = (my - 2).max(0) as usize;
+        self.cursor_bg_w = bw;
+        self.cursor_bg_h = bh;
+        self.cursor_bg_pos = Some((sx as i32, sy as i32));
+
+        let mut i = 0;
+        for yy in 0..bh {
+            let dy = sy + yy;
+            if dy >= self.height { break; }
+            for xx in 0..bw {
+                let dx = sx + xx;
+                let dst = i * self.bpp;
+                i += 1;
+                if dx >= self.width {
+                    continue;
+                }
+                let src = dy * self.stride * self.bpp + dx * self.bpp;
+                for k in 0..self.bpp {
+                    self.cursor_bg[dst + k] = self.back[src + k];
+                }
+            }
+        }
 
         for &(dx, dy, c) in pixels {
             let x = mx + dx;
@@ -147,14 +189,36 @@ impl Writer {
             let color = if c == 0 { Color::DARK } else { Color::WHITE };
             self.set_pixel(x as usize, y as usize, color);
         }
-        self.last_cursor = Some((mx, my));
 
-        let new_rect = (mx - 1, my - 1, cw + 2, ch + 2);
+        let new_rect = (mx - 2, my - 2, self.cursor_bg_w as i32, self.cursor_bg_h as i32);
         (old_rect, new_rect)
     }
 
+    fn restore_cursor_bg(&mut self, sx: i32, sy: i32) {
+        if sx < 0 || sy < 0 { return; }
+        let sx = sx as usize;
+        let sy = sy as usize;
+        let bw = self.cursor_bg_w;
+        let bh = self.cursor_bg_h;
+        let mut i = 0;
+        for yy in 0..bh {
+            let dy = sy + yy;
+            if dy >= self.height { break; }
+            for xx in 0..bw {
+                let dx = sx + xx;
+                let src = i * self.bpp;
+                i += 1;
+                if dx >= self.width { continue; }
+                let dst = dy * self.stride * self.bpp + dx * self.bpp;
+                for k in 0..self.bpp {
+                    self.back[dst + k] = self.cursor_bg[src + k];
+                }
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
-        self.fill_rect(0, 0, self.width, self.height, self.bg);
+        self.fill_rect(0, 0, self.width, self.height, self.bg_color);
         self.cursor_x = 0;
         self.cursor_y = 0;
     }
@@ -164,7 +228,7 @@ impl Writer {
             self.cursor_x -= FONT_WIDTH;
             for row in 0..FONT_HEIGHT {
                 for col in 0..FONT_WIDTH {
-                    self.set_pixel(self.cursor_x + col, self.cursor_y + row, self.bg);
+                    self.set_pixel(self.cursor_x + col, self.cursor_y + row, self.bg_color);
                 }
             }
         }
@@ -594,9 +658,6 @@ impl Writer {
         self.cursor_y = sy;
     }
 
-    /// Рисует текст, **не затирая фон** под ним: только пиксели с alpha > 0.
-    /// Для кириллицы — только «горящие» пиксели 8×8.
-    /// Для ASCII — только пиксели с ненулевой alpha из растра (blend поверх).
     pub fn draw_text_at_alpha(&mut self, x: usize, y: usize, s: &str, fg: Color) {
         let sx = self.cursor_x;
         let sy = self.cursor_y;
@@ -611,7 +672,6 @@ impl Writer {
     }
 
     fn draw_char_alpha(&mut self, c: char, fg: Color) {
-        // 1. Noto (антиалиасинг, ASCII + латиница).
         if let Some(bitmap) = get_raster(c, FontWeight::Regular, RasterHeight::Size16) {
             let w = bitmap.width();
             let h = bitmap.height();
@@ -627,14 +687,16 @@ impl Writer {
             return;
         }
 
-        // 2. Кириллица — только on-пиксели.
         if let Some(bitmap) = cyrillic_font::get_cyrillic(c) {
+            // ИСПРАВЛЕНИЕ: сдвиг 8x8 глифов на +1 вниз. Раньше верхние
+            // засечки «Ф», «Д», «Ц» упирались в верхнюю границу FONT_HEIGHT
+            // и обрезались на один пиксель. Теперь есть зазор сверху.
             for (row, byte) in bitmap.iter().enumerate() {
                 for col in 0..8usize {
                     let on = (byte >> (7 - col)) & 1 == 1;
                     if !on { continue; }
                     let x0 = self.cursor_x + col;
-                    let y0 = self.cursor_y + row * 2;
+                    let y0 = self.cursor_y + row * 2 + 1;
                     self.set_pixel(x0, y0, fg);
                     self.set_pixel(x0, y0 + 1, fg);
                     if col == 7 {
@@ -646,7 +708,6 @@ impl Writer {
             return;
         }
 
-        // 3. Fallback: '?' (только альфа-пиксели).
         if let Some(bitmap) = get_raster('?', FontWeight::Regular, RasterHeight::Size16) {
             let w = bitmap.width();
             let h = bitmap.height();
@@ -662,10 +723,6 @@ impl Writer {
         }
     }
 
-    /// Текст с обводкой 1 px. Сначала рисуем контур по 8 смещениям,
-    /// потом основной текст поверх. Работает и для кириллицы, и для ASCII,
-    /// потому что и обводка, и основной текст рисуются только по «горящим»
-    /// пикселям, не затирая фон прямоугольником.
     pub fn draw_text_outlined(
         &mut self,
         x: usize,
@@ -702,7 +759,7 @@ impl Writer {
                 if self.cursor_x + FONT_WIDTH > self.width {
                     self.newline();
                 }
-                self.draw_char_colored(c, self.fg, self.bg);
+                self.draw_char_colored(c, self.fg, self.bg_color);
                 self.cursor_x += FONT_WIDTH;
             }
         }
@@ -752,7 +809,9 @@ impl Writer {
                 let on = (byte >> (7 - col)) & 1 == 1;
                 let color = if on { fg } else { bg };
                 let x0 = self.cursor_x + col;
-                let y0 = self.cursor_y + row * 2;
+                // ИСПРАВЛЕНИЕ: +1 сдвиг вниз — верхние глифы «Ф», «Д», «Ц»
+                // больше не подрезаны верхней границей строки.
+                let y0 = self.cursor_y + row * 2 + 1;
                 let y1 = y0 + 1;
                 self.set_pixel(x0, y0, color);
                 self.set_pixel(x0, y1, color);
@@ -797,6 +856,10 @@ pub fn with_writer<R, F: FnOnce(&mut Writer) -> R>(f: F) -> R {
 pub fn clear() { with_writer(|w| w.clear()); }
 pub fn backspace() { with_writer(|w| w.backspace()); }
 pub fn flush() { with_writer(|w| w.flush_all()); }
+
+pub fn invalidate_background() {
+    with_writer(|w| w.invalidate_bg());
+}
 
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;

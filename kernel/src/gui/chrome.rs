@@ -1,6 +1,5 @@
 //! Мелкие графические примитивы: иконки, стрелки, layout.
 
-use alloc::string::ToString;
 use crate::framebuffer::{Color, Writer};
 use crate::gui::icons::{self, IconKind};
 use super::state::{TITLE_H, Window};
@@ -36,17 +35,38 @@ pub fn draw_trash_icon(w: &mut Writer, x: usize, y: usize, color: Color) {
     w.fill_rect(x + 3, y + 5, 8, 8, color);
 }
 
+/// ИСПРАВЛЕНИЕ: раньше это была одна диагональная чёрточка из 10 пикселей.
+/// Теперь — настоящий карандаш: корпус из двух параллельных диагоналей,
+/// стержень-остриё в правом верхнем углу и ластик в левом нижнем.
 pub fn draw_pencil_icon(w: &mut Writer, x: usize, y: usize, color: Color) {
-    for i in 0..10usize {
-        w.fill_rect(x + 3 + i, y + 11 - i, 2, 2, color);
+    // Корпус: две параллельные диагональные линии (верх и низ),
+    // между ними — заполнение.
+    let n = 10usize;
+    for i in 0..n {
+        let px = x + 3 + i;
+        // Верхняя грань корпуса.
+        w.set_pixel(px, y + 12 - i, color);
+        w.set_pixel(px + 1, y + 12 - i, color);
+        // Нижняя грань корпуса.
+        w.set_pixel(px, y + 14 - i, color);
+        w.set_pixel(px + 1, y + 14 - i, color);
+        // Заполнение между гранями.
+        w.set_pixel(px, y + 13 - i, color);
+        w.set_pixel(px + 1, y + 13 - i, color);
     }
-    w.set_pixel(x + 3, y + 13, color);
+    // Стержень (остриё) — тонкая линия к правому верхнему углу.
+    w.set_pixel(x + 13, y + 2, color);
+    w.set_pixel(x + 14, y + 1, color);
+    w.set_pixel(x + 15, y + 0, color);
+    // Ластик (поперечная полоса у тупого конца).
+    w.set_pixel(x + 1, y + 13, color);
+    w.set_pixel(x + 2, y + 13, color);
+    w.set_pixel(x + 1, y + 14, color);
     w.set_pixel(x + 2, y + 14, color);
+    w.set_pixel(x + 1, y + 15, color);
+    w.set_pixel(x + 2, y + 15, color);
 }
 
-/// Иконка файла по расширению. Директория — жёлтая папка.
-/// `.txt` — Notepad, `.png`/`.bmp` — Paint, `.exe`/`.elf` — Terminal,
-/// всё остальное — generic File.
 pub fn draw_file_icon(w: &mut Writer, x: usize, y: usize, name: &str, is_dir: bool, size: usize) {
     if is_dir {
         icons::draw(IconKind::Folder, w, x, y, size, Color { r: 240, g: 190, b: 80 });

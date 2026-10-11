@@ -29,6 +29,7 @@ impl Calc {
             }
         }
     }
+
     fn fill(&mut self, x0: usize, y0: usize, w: usize, h: usize, c: (u8, u8, u8)) {
         for y in y0..y0 + h {
             for x in x0..x0 + w {
@@ -36,6 +37,8 @@ impl Calc {
             }
         }
     }
+
+    /// Рисует глиф 5×5 (умноженный на 2 = 10×10) с левым верхним углом (x, y).
     fn digit(&mut self, x: usize, y: usize, d: u8, c: (u8, u8, u8)) {
         const DIG: [[u8; 5]; 10] = [
             [0b01110,0b10001,0b10011,0b10101,0b11001],
@@ -58,6 +61,46 @@ impl Calc {
             }
         }
     }
+
+    /// ИСПРАВЛЕНИЕ: раньше кнопки рисовались пустыми — только фон.
+    /// Теперь для каждой метки рисуем соответствующий глиф или символ.
+    /// Все метки занимают 10×10 пикселей в левом верхнем углу (x, y).
+    fn symbol(&mut self, x: usize, y: usize, label: char, c: (u8, u8, u8)) {
+        match label {
+            '0'..='9' => self.digit(x, y, (label as u8) - b'0', c),
+            '+' => {
+                self.fill(x + 0, y + 4, 10, 2, c);
+                self.fill(x + 4, y + 0, 2, 10, c);
+            }
+            '-' => {
+                self.fill(x + 0, y + 4, 10, 2, c);
+            }
+            '*' => {
+                // Четыре диагонали из центра.
+                for i in 0..5 {
+                    self.fill(x + i, y + i, 2, 2, c);
+                    self.fill(x + 8 - i, y + i, 2, 2, c);
+                    self.fill(x + i, y + 8 - i, 2, 2, c);
+                    self.fill(x + 8 - i, y + 8 - i, 2, 2, c);
+                }
+            }
+            '/' => {
+                // Диагональ от нижнего-левого к верхнему-правому.
+                for i in 0..5 {
+                    self.fill(x + i * 2, y + 8 - i * 2, 2, 2, c);
+                }
+            }
+            '=' => {
+                self.fill(x + 0, y + 2, 10, 2, c);
+                self.fill(x + 0, y + 6, 10, 2, c);
+            }
+            '.' => {
+                self.fill(x + 4, y + 8, 2, 2, c);
+            }
+            _ => {}
+        }
+    }
+
     fn number(&mut self, x0: usize, y: usize, mut n: u64) {
         let mut digits = [0u8; 20];
         let mut count = 0;
@@ -69,21 +112,34 @@ impl Calc {
             x += 12;
         }
     }
-    fn button(&mut self, col: usize, row: usize, hover: bool) {
+
+    /// Кнопка с меткой. Метка 10×10 центрируется в 44×44.
+    fn button(&mut self, col: usize, row: usize, label: char, hover: bool) {
         let bx = 6 + col * 48;
         let by = 50 + row * 48;
         let c = if hover { BTN_HOVER } else { BTN };
         self.fill(bx, by, 44, 44, c);
+        // Метка 10×10 по центру: (44-10)/2 = 17.
+        self.symbol(bx + 17, by + 17, label, FG);
     }
+
     fn draw_all(&mut self, hc: Option<usize>, hr: Option<usize>) {
         self.clear();
         self.number(10, 14, self.display);
+        let labels = [
+            ['7', '8', '9', '/'],
+            ['4', '5', '6', '*'],
+            ['1', '2', '3', '-'],
+            ['0', '.', '=', '+'],
+        ];
         for r in 0..4 {
             for c in 0..4 {
-                self.button(c, r, hc == Some(c) && hr == Some(r));
+                let hover = hc == Some(c) && hr == Some(r);
+                self.button(c, r, labels[r][c], hover);
             }
         }
     }
+
     fn hit(&self, x: i32, y: i32) -> Option<(usize, usize)> {
         let bx = x - 6;
         let by = y - 50;
@@ -93,6 +149,7 @@ impl Calc {
         if col >= 4 || row >= 4 { return None; }
         Some((col, row))
     }
+
     fn click(&mut self, col: usize, row: usize) {
         let ch: u8 = match (row, col) {
             (0, 0) => b'7', (0, 1) => b'8', (0, 2) => b'9', (0, 3) => b'/',

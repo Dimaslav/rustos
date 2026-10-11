@@ -3,67 +3,94 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use userlib::*;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    write(b"[user] alive\n");
+    write(b"T0\n");
 
-    // Шаг 1: одиночная String.
-    {
-        let mut s = String::new();
-        s.push_str("hello");
-        write(b"[user] 1 push_str ok\n");
-    }
-
-    // Шаг 2: Vec<u32>.
+    // Vec<u32>
     {
         let mut v: Vec<u32> = Vec::new();
-        for i in 0..10u32 { v.push(i); }
-        write(b"[user] 2 vec_u32 ok\n");
+        for i in 0..10u32 {
+            v.push(i);
+        }
+        let sum: u32 = v.iter().sum();
+        if sum != 45 {
+            write(b"T1 vec FAIL sum\n");
+            exit(1);
+        }
+        write(b"T1 vec u32 ok\n");
     }
 
-    // Шаг 3: Vec<String> без format!.
+    // Vec<String>
     {
-        let mut vs: Vec<String> = Vec::new();
-        for _ in 0..50 {
+        let mut v: Vec<String> = Vec::new();
+        for i in 0..50u32 {
             let mut s = String::new();
             s.push_str("item");
-            vs.push(s);
+            let _ = i;
+            v.push(s);
         }
-        write(b"[user] 3 vec_string ok\n");
+        if v.len() != 50 {
+            write(b"T2 vec string FAIL len\n");
+            exit(1);
+        }
+        write(b"T2 vec string ok\n");
     }
 
-    // Шаг 4: format!.
+    // format!
     {
-        let s = alloc::format!("test-{}", 42);
-        write(b"[user] 4 format ok\n");
-        let _ = s;
+        let s = format!("test-{}", 42);
+        write(b"T3 format: ");
+        write(s.as_bytes());
+        write(b"\n");
+        if s.as_bytes() != b"test-42" {
+            write(b"T3 format FAIL\n");
+            exit(1);
+        }
     }
 
-    // Шаг 5: спавн shell.
-    write(b"[user] 5 spawning shell\n");
-    let shell_id = exec("shell");
-    if shell_id == u64::MAX {
-        write(b"[user] shell not found\n");
+    // Vec<u8> побольше — вдруг pool исчерпается
+    {
+        let mut big: Vec<u8> = Vec::new();
+        for i in 0..20000usize {
+            big.push((i & 0xFF) as u8);
+        }
+        if big.len() != 20000 {
+            write(b"T3.5 big vec FAIL\n");
+            exit(1);
+        }
+        write(b"T3.5 big vec 20000 ok\n");
+    }
+
+    write(b"T4 before exec\n");
+
+    let id = exec("shell");
+
+    write(b"T5 after exec\n");
+
+    if id == u64::MAX {
+        write(b"T6 shell failed\n");
     } else {
-        write(b"[user] shell spawned\n");
+        write(b"T6 shell spawned\n");
     }
 
+    // Второй spawn — calc
     sleep_ms(200);
-    write(b"[user] 6 spawning calc\n");
-    let calc_id = spawn_calc();
-    if calc_id == u64::MAX {
-        write(b"[user] calc failed\n");
+    let cid = spawn_calc();
+    if cid == u64::MAX {
+        write(b"T6.5 calc failed\n");
     } else {
-        write(b"[user] calc spawned\n");
+        write(b"T6.5 calc spawned\n");
     }
 
     loop {
-        sleep_ms(2000);
-        write(b"[user] heartbeat\n");
+        sleep_ms(1000);
+        write(b"T7 alive\n");
     }
 }
 

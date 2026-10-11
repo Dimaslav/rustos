@@ -27,6 +27,7 @@ pub mod mouse;
 pub mod pipe;
 pub mod png;
 pub mod power;
+pub mod procfs;
 pub mod rtc;
 pub mod sched;
 pub mod serial;

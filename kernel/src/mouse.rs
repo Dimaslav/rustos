@@ -14,7 +14,6 @@ pub enum MouseEvent {
     ButtonDown(MouseButton),
     ButtonUp(MouseButton),
     /// Колесо: положительное — вверх, отрицательное — вниз.
-    /// Обычно диапазон [-8..7] за один «щелчок», но драйвер не ограничивает.
     Wheel(i32),
 }
 
@@ -55,16 +54,23 @@ pub static PACKETS_DONE: AtomicU64 = AtomicU64::new(0);
 pub static IRQ_STARTS: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_screen(w: usize, h: usize) {
-    let w = (w as i32).max(1);
-    let h = (h as i32).max(1);
-    *SCREEN.lock() = (w, h);
-    let mut p = POS.lock();
-    p.0 = p.0.clamp(0, w - 1);
-    p.1 = p.1.clamp(0, h - 1);
+    // ИСПРАВЛЕНИЕ: SCREEN/POS трогаются и из IRQ12, поэтому запрещаем
+    // прерывания вокруг критической секции, чтобы не поймать реентрантный
+    // spin-lock из обработчика.
+    without_interrupts(|| {
+        let w = (w as i32).max(1);
+        let h = (h as i32).max(1);
+        *SCREEN.lock() = (w, h);
+        let mut p = POS.lock();
+        p.0 = p.0.clamp(0, w - 1);
+        p.1 = p.1.clamp(0, h - 1);
+    });
 }
 
 pub fn screen_size() -> (i32, i32) {
-    *SCREEN.lock()
+    // ИСПРАВЛЕНИЕ: раньше лок не был защищён — если IRQ12 прилетал
+    // в момент удержания SCREEN, мы получали вечный spin в обработчике.
+    without_interrupts(|| *SCREEN.lock())
 }
 
 pub fn position() -> (i32, i32) {
@@ -86,7 +92,6 @@ fn handle_byte(byte: u8) {
         let mut pkt = PACKET.lock();
         let pkt_size = if pkt.wheel_enabled { 4 } else { 3 };
 
-        // Первый байт пакета всегда имеет bit 3 = 1.
         if pkt.idx == 0 && (byte & 0x08) == 0 {
             return;
         }
@@ -104,7 +109,6 @@ fn handle_byte(byte: u8) {
 
     PACKETS_DONE.fetch_add(1, Ordering::Relaxed);
 
-    // Overflow в X/Y — пакет битый, пропускаем.
     if b[0] & 0xC0 != 0 {
         return;
     }
@@ -114,8 +118,6 @@ fn handle_byte(byte: u8) {
     let btn_bits = b[0] & 0x03;
 
     let wheel = if has_wheel {
-        // Z-ось: младшие 4 бита, знаковое (2's complement).
-        // Диапазон -8..7. Иногда мыши шлют больше — тогда два пакета.
         let raw = (b[3] & 0x0F) as i32;
         if raw & 0x08 != 0 { raw - 16 } else { raw }
     } else {
@@ -151,7 +153,7 @@ fn handle_byte(byte: u8) {
 }
 
 struct Packet {
-    bytes: [u8; 4],       // было [u8; 3] — теперь с запасом под Z
+    bytes: [u8; 4],
     idx: usize,
     prev_btn: u8,
     wheel_enabled: bool,
@@ -201,26 +203,21 @@ pub unsafe fn init() {
     let mut cmd: Port<u8> = Port::new(0x64);
     let mut data: Port<u8> = Port::new(0x60);
 
-    // 1. Включаем AUX port (мышь)
     wait_write();
     cmd.write(0xA8);
 
-    // 2. Читаем текущий config byte
     wait_write();
     cmd.write(0x20);
     wait_read();
     let before = data.read();
 
-    // 3. Устанавливаем bit 1 (IRQ12) и сбрасываем bit 5 (clock disable)
     let after = (before | 0x02) & !0x20;
 
-    // 4. Пишем обратно
     wait_write();
     cmd.write(0x60);
     wait_write();
     data.write(after);
 
-    // 5. Читаем обратно и проверяем
     wait_write();
     cmd.write(0x20);
     wait_read();
@@ -237,19 +234,15 @@ pub unsafe fn init() {
         crate::serial_println!("[mouse] !!! clock мыши выключен (bit 5) !!!");
     }
 
-    // 6. Set defaults
     mouse_write(0xF6);
     let _ = mouse_read();
 
-    // 7. IntelliMouse magic: 200, 100, 80 → включает колесо (если поддерживается).
-    //    На обычной мыши это no-op, но ID останется 0x00.
     for &val in &[200u8, 100u8, 80u8] {
         mouse_write(0xF3); let _ = mouse_read();
         mouse_write(val);  let _ = mouse_read();
     }
 
-    // 8. Query Device ID
-    mouse_write(0xF2); let _ = mouse_read();     // ack
+    mouse_write(0xF2); let _ = mouse_read();
     let id = mouse_read();
     let has_wheel = id == 0x03 || id == 0x04;
     PACKET.lock().wheel_enabled = has_wheel;
@@ -258,7 +251,6 @@ pub unsafe fn init() {
         id, has_wheel
     );
 
-    // 9. Enable data reporting
     mouse_write(0xF4);
     let a2 = mouse_read();
     crate::serial_println!("[mouse] F4 ack = {:#x} (ожидаем 0xFA)", a2);

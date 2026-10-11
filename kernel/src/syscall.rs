@@ -43,6 +43,7 @@ pub const SYS_PS: u64 = 39;
 pub const SYS_PIPE: u64 = 40;
 pub const SYS_DUP2: u64 = 41;
 pub const SYS_OPEN_WRITE: u64 = 42;
+pub const SYS_EXEC_REPLACE: u64 = 43;
 
 global_asm!(
     ".globl syscall_entry",
@@ -96,6 +97,44 @@ const REG_RDI: usize = 14;
 
 static MMAP_NEXT: AtomicU64 = AtomicU64::new(0x2000_0000);
 
+const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
+
+fn user_range_ok(ptr: u64, len: u64) -> bool {
+    if ptr == 0 && len != 0 {
+        return false;
+    }
+    if len == 0 {
+        return ptr < USER_ADDR_MAX || ptr == 0;
+    }
+    if ptr >= USER_ADDR_MAX {
+        return false;
+    }
+    match ptr.checked_add(len) {
+        Some(end) => end <= USER_ADDR_MAX,
+        None => false,
+    }
+}
+
+unsafe fn user_slice<'a>(ptr: u64, len: u64) -> Option<&'a [u8]> {
+    if !user_range_ok(ptr, len) {
+        return None;
+    }
+    if len == 0 {
+        return Some(&[]);
+    }
+    Some(core::slice::from_raw_parts(ptr as *const u8, len as usize))
+}
+
+unsafe fn user_slice_mut<'a>(ptr: u64, len: u64) -> Option<&'a mut [u8]> {
+    if !user_range_ok(ptr, len) {
+        return None;
+    }
+    if len == 0 {
+        return Some(&mut []);
+    }
+    Some(core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize))
+}
+
 #[repr(C)]
 struct StatBuf {
     size: u64,
@@ -137,6 +176,23 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) {
         },
         SYS_EXEC => sys_exec(a1, a2),
         SYS_EXEC_ARGV => sys_exec_argv(a1, a2, a3, a4),
+        SYS_EXEC_REPLACE => {
+            // ИСПРАВЛЕНИЕ: exec в текущем AS. Не возвращает значение,
+            // если успешно — регистры перенастроены на новый entry,
+            // syscall_entry сделает iretq прямо в новый _start.
+            let name = match read_user_str(a1, a2) {
+                Some(s) => s,
+                None => return,
+            };
+            // SAFETY: regs валиден, прерывания выключены (внутри int 0x80).
+            match unsafe { crate::user::exec_by_name_in_place(name, Vec::new(), regs) } {
+                Ok(()) => return,
+                Err(e) => {
+                    crate::log_warn!("[syscall] exec_replace({}) failed: {:?}", name, e);
+                    u64::MAX
+                }
+            }
+        }
         SYS_READ_KEY => sys_read_key(),
         SYS_WAIT => sys_wait(a1),
         SYS_KILL => if crate::sched::kill(a1) { 0 } else { u64::MAX },
@@ -167,7 +223,7 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) {
 
 fn write_fd_serial(buf: u64, len: u64) -> u64 {
     if buf == 0 || len == 0 { return 0; }
-    let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+    let Some(slice) = (unsafe { user_slice(buf, len) }) else { return u64::MAX };
     match core::str::from_utf8(slice) {
         Ok(s) => crate::serial_print!("{}", s),
         Err(_) => for &b in slice { crate::serial_print!("{}", b as char); },
@@ -182,9 +238,10 @@ fn sys_write(fd_no: u64, buf: u64, len: u64) -> u64 {
         Some(k) => k,
         None => return u64::MAX,
     };
-
-    let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
-
+    let slice = match unsafe { user_slice(buf, len) } {
+        Some(s) => s,
+        None => return u64::MAX,
+    };
     match kind {
         FdKind::Stdout | FdKind::Stderr => write_fd_serial(buf, len),
         FdKind::File { .. } => u64::MAX,
@@ -217,9 +274,10 @@ fn sys_read(fd_no: u64, buf: u64, len: u64) -> u64 {
         Some(k) => k,
         None => return u64::MAX,
     };
-
-    let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
-
+    let out = match unsafe { user_slice_mut(buf, len) } {
+        Some(s) => s,
+        None => return u64::MAX,
+    };
     match kind {
         FdKind::File { data, pos, .. } => {
             let avail = data.len().saturating_sub(pos);
@@ -230,10 +288,20 @@ fn sys_read(fd_no: u64, buf: u64, len: u64) -> u64 {
             n as u64
         }
         FdKind::PipeRead { pipe_id } => {
+            let mut guard = 0u32;
             loop {
                 match pipe::read(pipe_id, out) {
                     Some(n) => return n as u64,
-                    None => crate::sched::yield_now(),
+                    None => {
+                        guard += 1;
+                        if !pipe::is_alive(pipe_id) {
+                            return 0;
+                        }
+                        if guard > 1_000_000 {
+                            return u64::MAX;
+                        }
+                        crate::sched::yield_now();
+                    }
                 }
             }
         }
@@ -270,6 +338,7 @@ fn sys_close(fd_no: u64) -> u64 {
 
 fn sys_pipe(out_ptr: u64) -> u64 {
     if out_ptr == 0 { return u64::MAX; }
+    if !user_range_ok(out_ptr, 8) { return u64::MAX; }
     let pipe_id = match pipe::create() { Some(id) => id, None => return u64::MAX };
     let pid = crate::sched::current_id();
     let r = fd::alloc_fd(pid, FdKind::PipeRead { pipe_id });
@@ -289,12 +358,13 @@ fn sys_dup2(old_fd: u64, new_fd: u64) -> u64 {
 
 fn read_user_str(ptr: u64, len: u64) -> Option<&'static str> {
     if ptr == 0 || len == 0 { return None; }
-    let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    let slice = unsafe { user_slice(ptr, len)? };
     core::str::from_utf8(slice).ok()
 }
 
 fn read_user_cstr(ptr: u64, max: usize) -> Option<String> {
     if ptr == 0 { return None; }
+    if !user_range_ok(ptr, max.min(4096) as u64) { return None; }
     let mut buf: Vec<u8> = Vec::with_capacity(max.min(256));
     unsafe {
         for i in 0..max.min(4096) {
@@ -316,8 +386,10 @@ fn sys_exec(name_ptr: u64, name_len: u64) -> u64 {
 
 fn sys_exec_argv(name_ptr: u64, name_len: u64, argv_ptrs: u64, argc: u64) -> u64 {
     let name = match read_user_str(name_ptr, name_len) { Some(s) => s, None => return u64::MAX };
+    let argc = argc.min(64);
+    if !user_range_ok(argv_ptrs, argc * 8) { return u64::MAX; }
     let mut args: Vec<String> = Vec::new();
-    for i in 0..argc.min(64) {
+    for i in 0..argc {
         let p = unsafe { core::ptr::read_volatile((argv_ptrs + i * 8) as *const u64) };
         if p == 0 { break; }
         let s = match read_user_cstr(p, 256) { Some(s) => s, None => return u64::MAX };
@@ -345,7 +417,17 @@ fn sys_read_key() -> u64 {
         Some(Key::Backspace) => 0x08,
         Some(Key::Escape) => 0x1B,
         Some(Key::Tab) => 0x09,
-        Some(_) => 0,
+        Some(Key::Up) => 0x80,
+        Some(Key::Down) => 0x81,
+        Some(Key::Left) => 0x82,
+        Some(Key::Right) => 0x83,
+        Some(Key::Home) => 0x84,
+        Some(Key::End) => 0x85,
+        Some(Key::PageUp) => 0x86,
+        Some(Key::PageDown) => 0x87,
+        Some(Key::Delete) => 0x88,
+        Some(Key::F(n)) if n >= 1 && n <= 12 => 0x90 + (n as u64) - 1,
+        Some(_) => u64::MAX,
         None => u64::MAX,
     }
 }
@@ -365,15 +447,22 @@ fn sys_create_window(w: u64, h: u64, title_ptr: u64) -> u64 {
         String::from("window")
     };
 
-    let buf_len = (w as usize) * (h as usize) * 4;
-    let pages_needed = (buf_len + 4095) / 4096;
+    let buf_len = match (w as usize).checked_mul(h as usize).and_then(|v| v.checked_mul(4)) {
+        Some(v) => v,
+        None => return u64::MAX,
+    };
+    let pages_needed = match buf_len.checked_add(4095) {
+        Some(v) => v / 4096,
+        None => return u64::MAX,
+    };
 
     let mut guard = crate::memory::FRAME_ALLOCATOR.lock();
     let alloc = match guard.as_mut() { Some(a) => a, None => return u64::MAX };
 
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
-        | PageTableFlags::USER_ACCESSIBLE;
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
 
     for i in 0..pages_needed {
         let frame = match alloc.allocate_frame() { Some(f) => f, None => return u64::MAX };
@@ -391,6 +480,8 @@ fn sys_create_window(w: u64, h: u64, title_ptr: u64) -> u64 {
 
 fn sys_poll_event(win_id: u64, out_ptr: u64) -> u64 {
     if out_ptr == 0 { return 0; }
+    let sz = core::mem::size_of::<crate::win::WinEvent>() as u64;
+    if !user_range_ok(out_ptr, sz) { return 0; }
     match crate::win::poll_event(win_id) {
         Some(ev) => {
             unsafe { core::ptr::write_volatile(out_ptr as *mut crate::win::WinEvent, ev); }
@@ -409,16 +500,24 @@ fn sys_mmap(size: u64) -> u64 {
     if phys_offset_u64 == 0 { return u64::MAX; }
     let phys_offset = VirtAddr::new(phys_offset_u64);
 
-    let pages = (size + 4095) / 4096;
-    let total = pages * 4096;
+    let total = match size.checked_add(4095).map(|v| v & !4095u64) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
+    let pages = total / 4096;
+
     let base = MMAP_NEXT.fetch_add(total, Ordering::AcqRel);
+    if base.checked_add(total).map(|e| e > USER_ADDR_MAX).unwrap_or(true) {
+        return u64::MAX;
+    }
 
     let mut guard = crate::memory::FRAME_ALLOCATOR.lock();
     let alloc = match guard.as_mut() { Some(a) => a, None => return u64::MAX };
 
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
-        | PageTableFlags::USER_ACCESSIBLE;
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
 
     for i in 0..pages {
         let frame = match alloc.allocate_frame() { Some(f) => f, None => return u64::MAX };
@@ -434,6 +533,8 @@ fn sys_munmap(_addr: u64, _size: u64) -> u64 { 0 }
 
 fn sys_stat(path_ptr: u64, path_len: u64, out_ptr: u64) -> u64 {
     if out_ptr == 0 { return u64::MAX; }
+    let sz = core::mem::size_of::<StatBuf>() as u64;
+    if !user_range_ok(out_ptr, sz) { return u64::MAX; }
     let path = match read_user_str(path_ptr, path_len) { Some(s) => s, None => return u64::MAX };
     let (size, is_dir) = if path.starts_with("C:") {
         match crate::vfs::fat32_stat_path(path) { Some(v) => v, None => return u64::MAX }
@@ -479,11 +580,18 @@ fn sys_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) -> u64 {
 }
 
 const DIR_ENTRY_SIZE: u64 = 80;
+const PROC_ENTRY_SIZE: u64 = 48;
 
 fn sys_list(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_count: u64) -> u64 {
     let path = match read_user_str(path_ptr, path_len) { Some(s) => s, None => return u64::MAX };
     let entries = crate::vfs::list(path).ok().unwrap_or_default();
+    if buf_ptr == 0 || buf_count == 0 {
+        return entries.len() as u64;
+    }
     let n = entries.len().min(buf_count as usize);
+    let need = (n as u64) * DIR_ENTRY_SIZE;
+    if !user_range_ok(buf_ptr, need) { return u64::MAX; }
+
     for (i, e) in entries.iter().take(n).enumerate() {
         let ep = (buf_ptr + (i as u64) * DIR_ENTRY_SIZE) as *mut u8;
         unsafe {
@@ -501,12 +609,12 @@ fn sys_list(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_count: u64) -> u64 {
     n as u64
 }
 
-const PROC_ENTRY_SIZE: u64 = 48;
-
 fn sys_ps(buf_ptr: u64, buf_count: u64) -> u64 {
     if buf_ptr == 0 { return 0; }
     let threads = crate::sched::list_threads_snapshot();
     let n = threads.len().min(buf_count as usize);
+    let need = (n as u64) * PROC_ENTRY_SIZE;
+    if !user_range_ok(buf_ptr, need) { return u64::MAX; }
     for (i, t) in threads.iter().take(n).enumerate() {
         let ep = (buf_ptr + (i as u64) * PROC_ENTRY_SIZE) as *mut u8;
         unsafe {

@@ -11,7 +11,6 @@ pub const SECTOR_SIZE: usize = 512;
 const CACHE_SIZE: usize = 64;
 
 struct SectorCache {
-    /// (lba, data). Пустое — если `lba == u32::MAX` (невалидный слот).
     entries: Vec<(u32, [u8; SECTOR_SIZE])>,
     age: Vec<u32>,
     tick: u32,
@@ -45,7 +44,6 @@ impl SectorCache {
     }
 
     fn insert(&mut self, lba: u32, data: &[u8; SECTOR_SIZE]) {
-        // Если lba уже есть — обновляем.
         for i in 0..CACHE_SIZE {
             if self.entries[i].0 == lba {
                 self.entries[i].1.copy_from_slice(data);
@@ -54,7 +52,6 @@ impl SectorCache {
                 return;
             }
         }
-        // Свободный слот.
         for i in 0..CACHE_SIZE {
             if self.entries[i].0 == u32::MAX {
                 self.entries[i].0 = lba;
@@ -64,7 +61,6 @@ impl SectorCache {
                 return;
             }
         }
-        // LRU.
         let mut lru = 0usize;
         let mut lru_age = self.age[0];
         for i in 1..CACHE_SIZE {
@@ -102,19 +98,24 @@ impl AtaDrive {
         unsafe { Port::<u8>::new(self.io_base + 7).read() }
     }
 
-    fn wait_not_busy(&self) {
+    fn wait_not_busy(&self) -> bool {
         for _ in 0..1_000_000 {
             let s = self.status();
-            if s & 0x80 == 0 { break; }
+            if s & 0x80 == 0 { return true; }
         }
+        false
     }
 
-    fn wait_drq(&self) {
+    /// ИСПРАВЛЕНИЕ: раньше молча выходил по таймауту, возвращая управление
+    /// как будто всё ок. Теперь возвращает `false`, если DRQ так и не поднялся
+    /// и нет ошибки — вызывающий код обязан прервать операцию.
+    fn wait_drq(&self) -> bool {
         for _ in 0..1_000_000 {
             let s = self.status();
-            if s & 0x08 != 0 { return; }
-            if s & 0x01 != 0 { return; }
+            if s & 0x08 != 0 { return true; }   // DRQ=1, читаем/пишем
+            if s & 0x01 != 0 { return false; }  // ERR
         }
+        false
     }
 
     fn select_lba(&mut self, lba: u32, count: u8) {
@@ -132,10 +133,10 @@ impl AtaDrive {
     }
 
     fn real_read_sector(&mut self, lba: u32) -> Option<[u8; SECTOR_SIZE]> {
-        self.wait_not_busy();
+        if !self.wait_not_busy() { return None; }
         self.select_lba(lba, 1);
         unsafe { Port::<u8>::new(self.io_base + 7).write(0x20); }
-        self.wait_drq();
+        if !self.wait_drq() { return None; }
         let s = self.status();
         if s & 0x01 != 0 { return None; }
         let mut buf = [0u8; SECTOR_SIZE];
@@ -151,10 +152,10 @@ impl AtaDrive {
     }
 
     fn real_write_sector(&mut self, lba: u32, data: &[u8; SECTOR_SIZE]) -> bool {
-        self.wait_not_busy();
+        if !self.wait_not_busy() { return false; }
         self.select_lba(lba, 1);
         unsafe { Port::<u8>::new(self.io_base + 7).write(0x30); }
-        self.wait_drq();
+        if !self.wait_drq() { return false; }
         let s = self.status();
         if s & 0x01 != 0 { return false; }
         unsafe {

@@ -13,8 +13,14 @@ use x86_64::{
 
 use crate::{log_debug, log_info};
 
-const USER_STACK_BASE: u64 = 0x80_0000;
+/// Нижняя граница user-стека. Сама эта страница НЕ отображается —
+/// она служит guard-страницей: stack overflow попадёт в неё и вызовет
+/// page fault, а не тихо затрёт `user.elf` или другой регион.
+const USER_STACK_GUARD: u64 = 0x80_0000;
+const USER_STACK_GUARD_SIZE: u64 = 4096;
 const USER_STACK_SIZE: u64 = 32 * 1024;
+const USER_STACK_BASE: u64 = USER_STACK_GUARD + USER_STACK_GUARD_SIZE;
+const USER_STACK_TOP_ADDR: u64 = USER_STACK_BASE + USER_STACK_SIZE;
 
 static USER_ELF: &[u8] = include_bytes!("../user.elf");
 static WORKER_ELF: &[u8] = include_bytes!("../worker.elf");
@@ -97,10 +103,15 @@ fn spawn_elf(
                 }
                 log_debug!("[elf] bytes @ entry({:#x}): {:02x?}", loaded.entry, buf);
 
+                let stack_flags = PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::NO_EXECUTE;
+
                 let map_res = map_user_region(
                     &mut mapper, alloc,
                     USER_STACK_BASE, USER_STACK_SIZE,
-                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+                    stack_flags,
                 );
                 if let Err(e) = map_res {
                     Cr3::write(saved_frame, saved_flags);
@@ -117,12 +128,17 @@ fn spawn_elf(
     drop(guard);
 
     entry_slot.store(loaded.entry, Ordering::Release);
-    stack_slot.store(USER_STACK_BASE + USER_STACK_SIZE, Ordering::Release);
+    stack_slot.store(USER_STACK_TOP_ADDR, Ordering::Release);
 
     let parent = crate::sched::current_id();
-    let id = crate::sched::spawn_with_as(name, entry_fn, pml4_phys);
+
+    let id = x86_64::instructions::interrupts::without_interrupts(|| {
+        let id = crate::sched::spawn_with_as(name, entry_fn, pml4_phys);
+        PENDING_ARGS.lock().push((id, args));
+        id
+    });
+
     crate::fd::fork_from(parent, id);
-    PENDING_ARGS.lock().push((id, args));
     Ok(id)
 }
 
@@ -267,6 +283,120 @@ pub fn exec_by_name_args(name: &str, args: Vec<String>) -> SpawnResult<u64> {
     }
 }
 
+/// Найти ELF-байты по имени программы.
+pub fn elf_bytes_by_name(name: &str) -> Option<&'static [u8]> {
+    match name {
+        "calc" | "calculator" => Some(CALC_ELF),
+        "worker" => Some(WORKER_ELF),
+        "shell" => Some(SHELL_ELF),
+        "echo" => Some(ECHO_ELF),
+        "ls" => Some(LS_ELF),
+        "cat" => Some(CAT_ELF),
+        "ps" => Some(PS_ELF),
+        "user" => Some(USER_ELF),
+        _ => None,
+    }
+}
+
+/// Реализация `exec`: заменить образ **текущего** процесса.
+///
+/// # Механика
+///
+/// 1. Выделяем новый AS (PML4).
+/// 2. Переключаем CR3 на него (kernel-маппинги в PML4[1..] общие, поэтому
+///    наш код и стек продолжают работать).
+/// 3. Грузим новый ELF + мапим свежий user-стек.
+/// 4. Обновляем `pml4_phys` текущего потока в SCHED и `CURRENT_CR3`.
+/// 5. Освобождаем старый AS.
+/// 6. Переписываем iretq-фрейм, сохранённый `syscall_entry`: rip=entry,
+///    rsp=new_stack, rdi=argc, rsi=argv. Возвращаемся из syscall — `iretq`
+///    уводит нас прямо в новый `_start`.
+///
+/// # Safety
+/// - Вызывается только из `syscall_dispatch`.
+/// - `regs` — валидный указатель из `syscall_entry`, живёт до `iretq`.
+/// - Прерывания выключены (мы внутри `int 0x80`).
+pub unsafe fn exec_in_place(
+    elf: &[u8],
+    args: Vec<String>,
+    regs: *mut u64,
+) -> SpawnResult<()> {
+    let phys_offset_u64 = crate::memory::PHYS_OFFSET.load(Ordering::Acquire);
+    if phys_offset_u64 == 0 {
+        return Err(SpawnError::NoPhysOffset);
+    }
+    let phys_offset = VirtAddr::new(phys_offset_u64);
+
+    let (old_frame, _old_flags) = Cr3::read();
+    let old_pml4 = old_frame.start_address().as_u64();
+
+    let loaded;
+    let new_pml4;
+    {
+        let mut guard = crate::memory::FRAME_ALLOCATOR.lock();
+        let alloc = guard.as_mut().ok_or(SpawnError::NoFrameAllocator)?;
+
+        let new_as = crate::memory::AddressSpace::new_user(phys_offset, alloc)
+            .ok_or(SpawnError::NoAddressSpace)?;
+        new_pml4 = new_as.pml4_frame.start_address().as_u64();
+
+        // Переключаем CR3 на новый AS, чтобы `copy_nonoverlapping` внутри
+        // elf::load писал в свежую память. Kernel-часть PML4[1..] общая.
+        Cr3::write(new_as.pml4_frame, Cr3Flags::empty());
+
+        let mut mapper = new_as.mapper(phys_offset);
+        loaded = match crate::elf::load(elf, &mut mapper, alloc) {
+            Ok(l) => l,
+            Err(e) => {
+                Cr3::write(old_frame, Cr3Flags::empty());
+                crate::memory::AddressSpace::destroy(new_pml4);
+                return Err(SpawnError::Elf(e));
+            }
+        };
+
+        let stack_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        if let Err(e) = map_user_region(
+            &mut mapper, alloc,
+            USER_STACK_BASE, USER_STACK_SIZE, stack_flags,
+        ) {
+            Cr3::write(old_frame, Cr3Flags::empty());
+            crate::memory::AddressSpace::destroy(new_pml4);
+            return Err(e);
+        }
+    }
+
+    let (new_rsp, argv_ptr, argc) = setup_user_stack(USER_STACK_TOP_ADDR, &args);
+
+    crate::sched::replace_current_pml4(new_pml4);
+    crate::memory::AddressSpace::destroy(old_pml4);
+
+    // Переписываем iretq-фрейм syscall_entry.
+    // Layout (см. `syscall_entry`):
+    //   0=rax, 1=r15..14=rdi, 15=rip, 16=cs, 17=rflags, 18=rsp, 19=ss
+    for i in 0..15 {
+        *regs.add(i) = 0;
+    }
+    *regs.add(14) = argc;         // rdi
+    *regs.add(13) = argv_ptr;     // rsi
+    *regs.add(15) = loaded.entry; // rip
+    *regs.add(18) = new_rsp;      // rsp
+
+    Ok(())
+}
+
+/// `exec_replace(name)` из syscall.
+pub unsafe fn exec_by_name_in_place(
+    name: &str,
+    args: Vec<String>,
+    regs: *mut u64,
+) -> SpawnResult<()> {
+    let elf = elf_bytes_by_name(name).ok_or(SpawnError::UnknownProgram)?;
+    exec_in_place(elf, args, regs)
+}
+
 fn map_user_region(
     mapper: &mut impl Mapper<Size4KiB>,
     alloc: &mut impl FrameAllocator<Size4KiB>,
@@ -288,13 +418,6 @@ fn map_user_region(
 }
 
 /// Кладёт args на user-стек. Возвращает (RSP, argv_ptr, argc).
-///
-/// System V AMD64 ABI: при входе в функцию RSP % 16 == 8 (как будто только
-/// что сделан `call`). Компилятор user-кода использует `movaps [rsp - N]`
-/// для SSE, и если RSP не выровнен — ловим #GP → #DF → RIP=0.
-///
-/// Поэтому после раскладки argv делаем `sp &= !15` (теперь 16-выровнен),
-/// затем `sp -= 8` (становится ≡ 8 mod 16).
 unsafe fn setup_user_stack(stack_top: u64, args: &[String]) -> (u64, u64, u64) {
     let mut sp = stack_top;
     let mut str_ptrs: Vec<u64> = Vec::new();
@@ -310,7 +433,6 @@ unsafe fn setup_user_stack(stack_top: u64, args: &[String]) -> (u64, u64, u64) {
     }
     str_ptrs.reverse();
 
-    // NULL-терминатор argv.
     sp -= 8;
     *(sp as *mut u64) = 0;
     for p in str_ptrs.iter().rev() {
@@ -319,11 +441,9 @@ unsafe fn setup_user_stack(stack_top: u64, args: &[String]) -> (u64, u64, u64) {
     }
     let argv_ptr = sp;
 
-    // argc — на случай, если user-код смотрит на [rsp] в старом стиле.
     sp -= 8;
     *(sp as *mut u64) = args.len() as u64;
 
-    // Выравнивание стека по System V ABI: RSP % 16 == 8 на входе в _start.
     sp &= !15;
     sp -= 8;
 
@@ -331,22 +451,6 @@ unsafe fn setup_user_stack(stack_top: u64, args: &[String]) -> (u64, u64, u64) {
 }
 
 /// Переход Ring 0 → Ring 3 с argv (rdi=argc, rsi=argv).
-///
-/// Использует явные регистры (rax, rcx, rdx, rsi, rdi, r8, r9), потому что
-/// порядок push'ей для iretq критичен. Именованные аргументы asm! не подходят
-/// — мы не можем позволить компилятору перераспределить регистры.
-///
-/// Порядок push'ей (снизу вверх по стеку):
-///   push rax  → SS
-///   push rcx  → RSP
-///   push rdx  → RFLAGS
-///   push rsi  → CS
-///   push rdi  → RIP
-/// Затем iretq снимает их в обратном порядке: RIP, CS, RFLAGS, RSP, SS.
-/// После iretq rdi/rsi задают argc/argv для точки входа user-кода.
-///
-/// # Safety
-/// Валидные селекторы, entry, stack_top; CR3 = user-AS.
 pub unsafe fn enter_user(entry: u64, stack_top: u64, args: &[String]) -> ! {
     let user_cs = crate::gdt::user_code_selector().0 as u64;
     let user_ss = crate::gdt::user_data_selector().0 as u64;

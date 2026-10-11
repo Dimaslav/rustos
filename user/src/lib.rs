@@ -6,6 +6,7 @@ extern crate alloc;
 
 use core::arch::asm;
 use core::alloc::{GlobalAlloc, Layout};
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ---------- Syscall ABI ----------
@@ -104,6 +105,23 @@ pub fn exec_argv(name: &str, args: &[&str]) -> u64 {
     }
 }
 
+/// Syscall 43: заменить образ **текущего** процесса. При успехе
+/// управление уходит в `_start` новой программы — функция **не
+/// возвращается**.
+pub const SYS_EXEC_REPLACE: u64 = 43;
+
+#[inline(always)]
+pub fn exec_replace(name: &str) -> u64 {
+    unsafe {
+        syscall(
+            SYS_EXEC_REPLACE,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            0,
+        )
+    }
+}
+
 // ---------- Файлы ----------
 
 #[inline(always)]
@@ -111,8 +129,6 @@ pub fn open(path: &str) -> u64 {
     unsafe { syscall(5, path.as_ptr() as u64, path.len() as u64, 0) }
 }
 
-/// Открывает файл для записи. `append=false` — обнуляет файл, `true` — дописывает.
-/// Возвращает fd или `u64::MAX`.
 #[inline(always)]
 pub fn open_write(path: &str, append: bool) -> u64 {
     unsafe {
@@ -367,10 +383,14 @@ unsafe fn pool_new(size: usize) -> bool {
 unsafe fn alloc_impl(layout: Layout) -> *mut u8 {
     let align = layout.align().max(16);
     let size = layout.size();
+
     if POOL_BASE.load(Ordering::Relaxed) == 0 {
         let chunk = size.max(POOL_CHUNK);
-        if !pool_new(chunk) { return core::ptr::null_mut(); }
+        if !pool_new(chunk) {
+            return core::ptr::null_mut();
+        }
     }
+
     loop {
         let base = POOL_BASE.load(Ordering::Relaxed);
         let pool_size = POOL_SIZE.load(Ordering::Relaxed);
@@ -382,7 +402,9 @@ unsafe fn alloc_impl(layout: Layout) -> *mut u8 {
             return (base + aligned) as *mut u8;
         }
         let chunk = size.max(POOL_CHUNK);
-        if !pool_new(chunk) { return core::ptr::null_mut(); }
+        if !pool_new(chunk) {
+            return core::ptr::null_mut();
+        }
     }
 }
 
@@ -393,7 +415,42 @@ unsafe impl GlobalAlloc for BumpAlloc {
         alloc_unlock();
         result
     }
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+    }
+
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        layout: Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        if new_size == 0 {
+            return core::ptr::null_mut();
+        }
+        alloc_lock();
+
+        let new_layout = match Layout::from_size_align(new_size, layout.align()) {
+            Ok(l) => l,
+            Err(_) => {
+                alloc_unlock();
+                return core::ptr::null_mut();
+            }
+        };
+
+        let new_ptr = alloc_impl(new_layout);
+        if !new_ptr.is_null() {
+            let n = core::cmp::min(layout.size(), new_size);
+            let mut i = 0;
+            while i < n {
+                let b = core::ptr::read_volatile(ptr.add(i));
+                core::ptr::write_volatile(new_ptr.add(i), b);
+                i += 1;
+            }
+        }
+        alloc_unlock();
+        new_ptr
+    }
 }
 
 #[global_allocator]
@@ -421,4 +478,79 @@ pub unsafe fn collect_args(argc: u64, argv: *const *const u8) -> alloc::vec::Vec
         if let Ok(s) = alloc::string::String::from_utf8(buf) { v.push(s); }
     }
     v
+}
+
+// ---------- mem* / strlen ----------
+
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    let d = dest as *mut u8;
+    let s = src as *const u8;
+    let mut i = 0;
+    while i < n {
+        *d.add(i) = *s.add(i);
+        i += 1;
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    let d = dest as *mut u8;
+    let s = src as *const u8;
+    if (d as usize) < (s as usize) {
+        let mut i = 0;
+        while i < n {
+            *d.add(i) = *s.add(i);
+            i += 1;
+        }
+    } else {
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            *d.add(i) = *s.add(i);
+        }
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memset(dest: *mut c_void, c: i32, n: usize) -> *mut c_void {
+    let d = dest as *mut u8;
+    let v = c as u8;
+    let mut i = 0;
+    while i < n {
+        *d.add(i) = v;
+        i += 1;
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> i32 {
+    let pa = a as *const u8;
+    let pb = b as *const u8;
+    let mut i = 0;
+    while i < n {
+        let x = *pa.add(i);
+        let y = *pb.add(i);
+        if x != y {
+            return x as i32 - y as i32;
+        }
+        i += 1;
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bcmp(a: *const c_void, b: *const c_void, n: usize) -> i32 {
+    memcmp(a, b, n)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strlen(s: *const i8) -> usize {
+    let p = s as *const u8;
+    let mut n = 0;
+    while *p.add(n) != 0 { n += 1; }
+    n
 }

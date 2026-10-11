@@ -8,6 +8,7 @@ pub mod icons;
 pub mod input;
 pub mod notepad;
 pub mod state;
+pub mod taskbar_layout;
 pub mod theme;
 
 pub use state::{App, AppKind, Window, CURSOR};
@@ -69,6 +70,8 @@ pub struct Wm {
 pub fn run() -> ! {
     let (sw, sh) = framebuffer::with_writer(|w| (w.width, w.height));
     mouse::set_screen(sw, sh);
+
+    state::init_layout(sw, sh);
 
     let mut wm = Wm::new();
     let mut last_pos = mouse::position();
@@ -463,16 +466,16 @@ impl Wm {
             ),
         };
 
-        // Размеры окон под Full HD (1920×1080).
+        let l = state::layout();
         let (ww, wh) = if kind == AppKind::Explorer {
-            (1200, 760)
+            (l.explorer_w, l.explorer_h)
         } else {
-            (760, 520)
+            (l.app_w, l.app_h)
         };
-        let off = self.windows.len() as i32 * 40;
+        let off = self.windows.len() as i32 * l.win_offset;
         self.windows.push(Window {
-            x: 220 + off,
-            y: 140 + off,
+            x: l.fb_w as i32 / 6 + off,
+            y: l.fb_h as i32 / 8 + off,
             w: ww,
             h: wh,
             title,
@@ -715,12 +718,15 @@ impl Wm {
         ]
     }
 
-    /// Сетка 5×5 под Full HD: столбцы по 130 px, ряды по 105 px.
     pub(in crate::gui) fn icon_rect(i: usize) -> (usize, usize, usize, usize) {
-        use state::{ICON_STEP, ICON_X, ICON_Y};
-        let col = i / 5;
-        let row = i % 5;
-        (ICON_X + col * ICON_STEP, ICON_Y + row * 105, 44, 66)
+        let l = state::layout();
+        let col = i / l.icon_cols;
+        let row = i % l.icon_cols;
+        (
+            l.icon_x + col * l.icon_step_x,
+            l.icon_y + row * l.icon_step_y,
+            44, 66,
+        )
     }
 
     pub(in crate::gui) fn app_kind_of(win: &Window) -> AppKind {
