@@ -44,6 +44,12 @@ pub const SYS_PIPE: u64 = 40;
 pub const SYS_DUP2: u64 = 41;
 pub const SYS_OPEN_WRITE: u64 = 42;
 pub const SYS_EXEC_REPLACE: u64 = 43;
+pub const SYS_FORK: u64 = 44;
+pub const SYS_IMAGE_DECODE: u64 = 45;
+pub const SYS_SOUND_BEEP: u64 = 46;
+pub const SYS_SOUND_PLAY_PCM: u64 = 47;
+pub const SYS_NET_PING: u64 = 48;
+pub const SYS_NET_INFO: u64 = 49;
 
 global_asm!(
     ".globl syscall_entry",
@@ -177,14 +183,10 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) {
         SYS_EXEC => sys_exec(a1, a2),
         SYS_EXEC_ARGV => sys_exec_argv(a1, a2, a3, a4),
         SYS_EXEC_REPLACE => {
-            // ИСПРАВЛЕНИЕ: exec в текущем AS. Не возвращает значение,
-            // если успешно — регистры перенастроены на новый entry,
-            // syscall_entry сделает iretq прямо в новый _start.
             let name = match read_user_str(a1, a2) {
                 Some(s) => s,
                 None => return,
             };
-            // SAFETY: regs валиден, прерывания выключены (внутри int 0x80).
             match unsafe { crate::user::exec_by_name_in_place(name, Vec::new(), regs) } {
                 Ok(()) => return,
                 Err(e) => {
@@ -193,6 +195,17 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) {
                 }
             }
         }
+        SYS_FORK => sys_fork(regs),
+        SYS_IMAGE_DECODE => sys_image_decode(a1, a2, a3, a4),
+        SYS_SOUND_BEEP => {
+            let freq = a1 as u32;
+            let ms = a2 as u32;
+            crate::ac97::beep(freq, ms);
+            0
+        }
+        SYS_SOUND_PLAY_PCM => sys_sound_play_pcm(a1, a2),
+        SYS_NET_PING => sys_net_ping(a1, a2, a3),
+        SYS_NET_INFO => sys_net_info(a1),
         SYS_READ_KEY => sys_read_key(),
         SYS_WAIT => sys_wait(a1),
         SYS_KILL => if crate::sched::kill(a1) { 0 } else { u64::MAX },
@@ -219,6 +232,16 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) {
     };
 
     unsafe { *regs.add(REG_RAX) = result; }
+}
+
+fn sys_fork(regs: *mut u64) -> u64 {
+    match unsafe { crate::user::fork_in_place(regs) } {
+        Ok(pid) => pid,
+        Err(e) => {
+            crate::log_warn!("[syscall] fork failed: {:?}", e);
+            u64::MAX
+        }
+    }
 }
 
 fn write_fd_serial(buf: u64, len: u64) -> u64 {
@@ -626,4 +649,118 @@ fn sys_ps(buf_ptr: u64, buf_count: u64) -> u64 {
         }
     }
     n as u64
+}
+
+fn sys_image_decode(data_ptr: u64, data_len: u64, out_ptr: u64, out_cap: u64) -> u64 {
+    let slice = match unsafe { user_slice(data_ptr, data_len) } {
+        Some(s) => s,
+        None => return u64::MAX,
+    };
+
+    let is_png = slice.len() >= 8
+        && slice[0] == 0x89
+        && &slice[1..4] == b"PNG"
+        && slice[4] == 0x0D
+        && slice[5] == 0x0A
+        && slice[6] == 0x1A
+        && slice[7] == 0x0A;
+    let is_bmp = slice.len() >= 2 && &slice[0..2] == b"BM";
+
+    let (w, h, pixels) = if is_png {
+        match crate::png::decode(slice) {
+            Some(p) => (p.width, p.height, p.pixels),
+            None => return u64::MAX,
+        }
+    } else if is_bmp {
+        match crate::bmp::decode(slice) {
+            Some(b) => (b.width, b.height, b.pixels),
+            None => return u64::MAX,
+        }
+    } else {
+        crate::log_warn!(
+            "[image] unknown format: first bytes {:02x?}",
+            &slice[..slice.len().min(8)]
+        );
+        return u64::MAX;
+    };
+
+    if out_ptr == 0 {
+        return ((w as u64) << 32) | (h as u64);
+    }
+
+    let needed = match w.checked_mul(h).and_then(|v| v.checked_mul(3)) {
+        Some(n) => n,
+        None => return u64::MAX,
+    };
+    if (out_cap as usize) < needed {
+        return u64::MAX;
+    }
+
+    let dst = match unsafe { user_slice_mut(out_ptr, needed as u64) } {
+        Some(s) => s,
+        None => return u64::MAX,
+    };
+    dst.copy_from_slice(&pixels);
+
+    ((w as u64) << 32) | (h as u64)
+}
+
+fn sys_sound_play_pcm(ptr: u64, nsamp: u64) -> u64 {
+    let n = nsamp as usize;
+    if n == 0 { return 0; }
+    let bytes = n * 2;
+    if !user_range_ok(ptr, bytes as u64) { return u64::MAX; }
+    let slice = unsafe {
+        core::slice::from_raw_parts(ptr as *const i16, n)
+    };
+    crate::ac97::play_samples(slice);
+    0
+}
+
+/// Ping по IPv4. `ip` упакован как `a<<24 | b<<16 | c<<8 | d`.
+/// Возвращает RTT в миллисекундах, или u64::MAX при таймауте.
+fn sys_net_ping(ip_packed: u64, timeout_ms: u64, _flags: u64) -> u64 {
+    let ip = [
+        ((ip_packed >> 24) & 0xFF) as u8,
+        ((ip_packed >> 16) & 0xFF) as u8,
+        ((ip_packed >> 8) & 0xFF) as u8,
+        (ip_packed & 0xFF) as u8,
+    ];
+    match crate::net::ping(ip, if timeout_ms == 0 { 2000 } else { timeout_ms }) {
+        Some(rtt) => rtt,
+        None => u64::MAX,
+    }
+}
+
+/// Упаковать наш сетевой конфиг в u64. out_ptr — буфер на 4×u32:
+///   [0] = our_ip
+///   [1] = gateway_ip
+///   [2] = dns_ip
+///   [3] = mac (в младших 48 битах)
+fn sys_net_info(out_ptr: u64) -> u64 {
+    if out_ptr == 0 { return u64::MAX; }
+    if !user_range_ok(out_ptr, 16) { return u64::MAX; }
+
+    let our = crate::net::our_ip();
+    let gw = crate::net::gateway_ip();
+    let dns = crate::net::DNS_IP;
+    let mac = match crate::e1000::mac() {
+        Some(m) => m,
+        None => [0u8; 6],
+    };
+    let mac_packed: u64 = (mac[0] as u64) << 40
+        | (mac[1] as u64) << 32
+        | (mac[2] as u64) << 24
+        | (mac[3] as u64) << 16
+        | (mac[4] as u64) << 8
+        | (mac[5] as u64);
+
+    unsafe {
+        let p = out_ptr as *mut u32;
+        *p = u32::from_be_bytes(our);
+        *p.add(1) = u32::from_be_bytes(gw);
+        *p.add(2) = u32::from_be_bytes(dns);
+        *p.add(3) = mac_packed as u32; // младшие 32 бита MAC
+    }
+    0
 }

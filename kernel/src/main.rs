@@ -7,10 +7,12 @@ extern crate alloc;
 
 use core::arch::asm;
 
+pub mod ac97;
 pub mod allocator;
 pub mod bmp;
 pub mod cyrillic_font;
 pub mod disk;
+pub mod e1000;
 pub mod elf;
 pub mod fat32;
 pub mod fd;
@@ -24,6 +26,8 @@ pub mod keyboard;
 pub mod log;
 pub mod memory;
 pub mod mouse;
+pub mod net;
+pub mod pci;
 pub mod pipe;
 pub mod png;
 pub mod power;
@@ -50,8 +54,6 @@ use x86_64::VirtAddr;
 #[allow(deprecated)]
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
-    // Требуем минимум Full HD. Если QEMU не даст 1920x1080, bootloader
-    // паникует — тогда в src/main.rs надо уменьшить xres/yres.
     config.frame_buffer.minimum_framebuffer_width = Some(1920);
     config.frame_buffer.minimum_framebuffer_height = Some(1080);
     config.mappings.physical_memory = Some(Mapping::Dynamic);
@@ -156,6 +158,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init();
     log_info!("[boot] 9. interrupts ready");
 
+    {
+        let audio = crate::pci::find_audio();
+        if audio.is_empty() {
+            log_info!("[pci] no audio device");
+        } else {
+            for d in &audio {
+                log_info!(
+                    "[pci] audio: {:04x}:{:04x} at {:02x}:{:02x}.{} bar0={:#010x} bar1={:#010x}",
+                    d.vendor, d.device, d.bus, d.slot, d.func, d.bar[0], d.bar[1]
+                );
+            }
+            if crate::ac97::init() {
+                log_info!("[boot] 9.4 ac97 ready");
+            }
+        }
+    }
+
+    if crate::e1000::init() {
+        log_info!("[boot] 9.5 e1000 ready");
+        log_info!("[boot] 9.6 net ready (our ip = 10.0.2.15)");
+    }
+
     crate::task::spawn(crate::task::clock::clock_task());
     crate::task::spawn(crate::task::repeat::repeat_task());
 
@@ -175,9 +199,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(not(feature = "headless_test"))]
     {
         crate::sched::spawn("demo", demo_thread);
-        match unsafe { crate::user::spawn_user_test(phys_offset) } {
-            Ok(_id) => log_info!("[boot] 9.8 user thread spawned"),
-            Err(e) => log_warn!("[boot] user thread not spawned: {:?}", e),
+        match unsafe { crate::user::spawn_init_elf(phys_offset) } {
+            Ok(_id) => log_info!("[boot] 9.8 init spawned"),
+            Err(e) => log_warn!("[boot] init not spawned: {:?}", e),
         }
 
         log_info!("[boot] 10. entering GUI");

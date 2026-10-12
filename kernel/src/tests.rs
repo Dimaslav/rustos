@@ -33,11 +33,8 @@ pub fn run_all() -> u32 {
     serial_println!("[TEST] === smoke tests begin ===");
     let mut s = Stats::new();
 
-    // ============================================================
-    // 1. Базовая инфраструктура: heap, format, Vec, String
-    // ============================================================
+    // ---------- 1. Базовая инфраструктура ----------
     {
-        use alloc::vec::Vec;
         let v: Vec<u8> = (0..1000).map(|i| (i & 0xFF) as u8).collect();
         s.check("heap_alloc_1000",
             v.len() == 1000 && v[500] == ((500u32 & 0xFF) as u8),
@@ -65,25 +62,25 @@ pub fn run_all() -> u32 {
         s.check("heap_many_allocs_no_overlap", all_ok,
             "перекрытие или порча аллокаций");
     }
+    {
+        let layout = core::alloc::Layout::from_size_align(13, 64).unwrap();
+        let p = unsafe { alloc::alloc::alloc(layout) };
+        let ok = !p.is_null() && (p as usize) % 64 == 0;
+        if !p.is_null() { unsafe { alloc::alloc::dealloc(p, layout) }; }
+        s.check("heap_align_64", ok, "аллокация не выровнена на 64");
+    }
 
-    // ============================================================
-    // 2. RAMFS
-    // ============================================================
+    // ---------- 2. RAMFS ----------
     {
         let created = crate::vfs::ramfs_create_file("/", "smoke.txt", b"hello");
         s.check("ramfs_create_file", created, "create_file вернул false");
-
         let data = crate::vfs::ramfs_read("/smoke.txt");
         s.check("ramfs_read_back",
-            data.as_deref() == Some(b"hello"),
-            "содержимое не совпало");
-
+            data.as_deref() == Some(b"hello"), "содержимое не совпало");
         let mk = crate::vfs::ramfs_mkdir("/", "smokedir");
         s.check("ramfs_mkdir", mk, "mkdir вернул false");
-
         let exists = crate::vfs::ramfs_exists("/smokedir");
         s.check("ramfs_exists_after_mkdir", exists, "mkdir не создал директорию");
-
         let rm = crate::vfs::ramfs_remove("/smoke.txt");
         s.check("ramfs_remove", rm, "remove вернул false");
 
@@ -91,24 +88,60 @@ pub fn run_all() -> u32 {
         let c = crate::vfs::ramfs_create_file("/smoke_sub", "a.txt", b"abc");
         let r = crate::vfs::ramfs_read("/smoke_sub/a.txt");
         s.check("ramfs_subdir_write_read",
-            c && r.as_deref() == Some(b"abc"),
-            "subdir write/read mismatch");
+            c && r.as_deref() == Some(b"abc"), "subdir mismatch");
         let _ = crate::vfs::ramfs_remove("/smoke_sub/a.txt");
         let _ = crate::vfs::ramfs_remove("/smoke_sub");
     }
+    {
+        let _ = crate::vfs::ramfs_mkdir("/", "deep_a");
+        let _ = crate::vfs::ramfs_mkdir("/deep_a", "deep_b");
+        let _ = crate::vfs::ramfs_mkdir("/deep_a/deep_b", "deep_c");
+        let c = crate::vfs::ramfs_create_file(
+            "/deep_a/deep_b/deep_c", "f.txt", b"deep-content");
+        let r = crate::vfs::ramfs_read("/deep_a/deep_b/deep_c/f.txt");
+        s.check("ramfs_deep_paths",
+            c && r.as_deref() == Some(b"deep-content"),
+            "deep nesting не работает");
+        let _ = crate::vfs::ramfs_remove("/deep_a/deep_b/deep_c/f.txt");
+        let _ = crate::vfs::ramfs_remove("/deep_a/deep_b/deep_c");
+        let _ = crate::vfs::ramfs_remove("/deep_a/deep_b");
+        let _ = crate::vfs::ramfs_remove("/deep_a");
+    }
+    {
+        let _ = crate::vfs::ramfs_create_file("/", "old_name.txt", b"rn");
+        let rn = crate::vfs::ramfs_rename("/old_name.txt", "new_name.txt");
+        let old_gone = !crate::vfs::ramfs_exists("/old_name.txt");
+        let new_there = crate::vfs::ramfs_exists("/new_name.txt");
+        let data = crate::vfs::ramfs_read("/new_name.txt");
+        s.check("ramfs_rename",
+            rn && old_gone && new_there && data.as_deref() == Some(b"rn"),
+            "rename не сработал");
+        let _ = crate::vfs::ramfs_remove("/new_name.txt");
+    }
 
-    // ============================================================
-    // 3. VFS API
-    // ============================================================
+    // ---------- 3. VFS API ----------
     {
         let list = crate::vfs::list("/").ok().unwrap_or_default();
         let has = list.iter().any(|e| e.name == "smokedir");
         s.check("vfs_list_root", has, "smokedir не видно в листинге /");
     }
+    {
+        let _ = crate::vfs::ramfs_create_file("/", "vfs_rt.txt", b"");
+        let w = crate::vfs::write("/vfs_rt.txt", b"vfs-data");
+        let r = crate::vfs::read("/vfs_rt.txt");
+        s.check("vfs_write_read_ramfs",
+            w.is_ok() && r.as_deref() == Ok(&b"vfs-data"[..]),
+            "vfs write/read mismatch");
+        let _ = crate::vfs::ramfs_remove("/vfs_rt.txt");
+    }
+    {
+        let _ = crate::vfs::ramfs_create_file("/", "vfs_ex.txt", b"x");
+        let ok = crate::vfs::exists("/vfs_ex.txt") && !crate::vfs::exists("/nope.txt");
+        s.check("vfs_exists_ramfs", ok, "exists false positive/negative");
+        let _ = crate::vfs::ramfs_remove("/vfs_ex.txt");
+    }
 
-    // ============================================================
-    // 4. FAT32 (soft — диск может отсутствовать)
-    // ============================================================
+    // ---------- 4. FAT32 (soft) ----------
     {
         let entries = crate::vfs::fat32_list_root();
         if entries.is_empty() {
@@ -121,20 +154,23 @@ pub fn run_all() -> u32 {
         }
     }
 
-    // ============================================================
-    // 5. Interrupts / ticks
-    // ============================================================
+    // ---------- 5. Interrupts ----------
     {
         let t0 = crate::interrupts::ticks();
         crate::sched::sleep_ms(100);
         let t1 = crate::interrupts::ticks();
-        s.check("timer_advances", t1 > t0,
-            "ticks не растут (IRQ0 не работает?)");
+        s.check("timer_advances", t1 > t0, "ticks не растут");
+    }
+    {
+        let t0 = crate::interrupts::ticks();
+        crate::sched::sleep_ms(500);
+        let t1 = crate::interrupts::ticks();
+        s.check("ticks_after_long_sleep",
+            t1.saturating_sub(t0) >= 5,
+            "за 500мс прошло меньше 5 тиков");
     }
 
-    // ============================================================
-    // 6. Scheduler: spawn + exit code + wait
-    // ============================================================
+    // ---------- 6. Scheduler ----------
     {
         extern "C" fn test_thread() -> ! {
             crate::sched::exit_current_with_code(42);
@@ -143,10 +179,6 @@ pub fn run_all() -> u32 {
         let code = crate::sched::wait_for(id);
         s.check("wait_exit_code_42", code == Some(42), "exit code не 42");
     }
-
-    // ============================================================
-    // 7. Scheduler: kill
-    // ============================================================
     {
         extern "C" fn slow_thread() -> ! {
             loop { crate::sched::sleep_ms(1000); }
@@ -156,12 +188,18 @@ pub fn run_all() -> u32 {
         let killed = crate::sched::kill(id);
         s.check("kill_returns_true", killed, "kill вернул false");
         let code = crate::sched::wait_for(id);
-        s.check("kill_exit_code_neg", code == Some(-9), "ожидали exit_code = -9");
+        s.check("kill_exit_code_neg", code == Some(-9), "ожидали -9");
     }
-
-    // ============================================================
-    // 8. getppid
-    // ============================================================
+    {
+        extern "C" fn slow2() -> ! {
+            loop { crate::sched::sleep_ms(1000); }
+        }
+        let id = crate::sched::spawn("smoke_kill_fast", slow2);
+        let killed = crate::sched::kill(id);
+        let code = crate::sched::wait_for(id);
+        s.check("spawn_and_immediate_kill",
+            killed && code == Some(-9), "immediate kill mismatch");
+    }
     {
         static CHILD_PPID: AtomicU64 = AtomicU64::new(u64::MAX);
         extern "C" fn child() -> ! {
@@ -176,10 +214,6 @@ pub fn run_all() -> u32 {
         let ppid = CHILD_PPID.load(Ordering::SeqCst);
         s.check("getppid_matches", ppid == me, "ppid != parent id");
     }
-
-    // ============================================================
-    // 9. Sleep + wake_thread
-    // ============================================================
     {
         static WOKEN: AtomicU64 = AtomicU64::new(0);
         extern "C" fn sleeper() -> ! {
@@ -195,13 +229,24 @@ pub fn run_all() -> u32 {
         let _ = crate::sched::wait_for(id);
         let after = WOKEN.load(Ordering::SeqCst);
         s.check("sleep_and_wake",
-            before == 1 && after == 2,
-            "не разбудили или не доспал");
+            before == 1 && after == 2, "не разбудили или не доспал");
+    }
+    {
+        extern "C" fn blocked() -> ! {
+            crate::sched::sleep_forever();
+            loop { crate::sched::sleep_ms(1000); }
+        }
+        let id = crate::sched::spawn("smoke_snapshot", blocked);
+        crate::sched::sleep_ms(20);
+        let snap = crate::sched::list_threads_snapshot();
+        let found = snap.iter().any(|t| t.id == id);
+        crate::sched::kill(id);
+        let _ = crate::sched::wait_for(id);
+        s.check("spawn_thread_state_snapshot", found,
+            "поток не виден в snapshot");
     }
 
-    // ============================================================
-    // 10. FAT32 subdirs (soft)
-    // ============================================================
+    // ---------- 7. FAT32 subdirs (soft) ----------
     {
         let entries = crate::vfs::fat32_list_root();
         if entries.is_empty() {
@@ -226,18 +271,14 @@ pub fn run_all() -> u32 {
         }
     }
 
-    // ============================================================
-    // 11. time_ms
-    // ============================================================
+    // ---------- 8. time_ms ----------
     {
         let t0 = crate::interrupts::ticks();
         let ms = (t0 * 1000) / 18;
         s.check("time_ms_no_overflow", ms < u64::MAX / 2, "переполнение");
     }
 
-    // ============================================================
-    // 12. procfs
-    // ============================================================
+    // ---------- 9. procfs ----------
     {
         let version = crate::vfs::read("/proc/version").ok();
         s.check("procfs_version_read",
@@ -276,21 +317,57 @@ pub fn run_all() -> u32 {
             .unwrap_or(false);
         s.check("procfs_ps_header", has_header, "/proc/ps без заголовка PID");
     }
+    {
+        let up = crate::vfs::read("/proc/uptime").ok().unwrap_or_default();
+        let s_str = core::str::from_utf8(&up).unwrap_or("");
+        s.check("procfs_uptime_format",
+            s_str.contains('.') && s_str.ends_with('\n'),
+            "/proc/uptime не содержит точку или \\n");
+    }
+    {
+        let mem = crate::vfs::read("/proc/meminfo").ok().unwrap_or_default();
+        let s_str = core::str::from_utf8(&mem).unwrap_or("");
+        s.check("procfs_meminfo_format",
+            s_str.contains("HeapTotal") && s_str.contains("HeapUsed"),
+            "/proc/meminfo не содержит полей");
+    }
+    {
+        let st = crate::vfs::read("/proc/self/status").ok().unwrap_or_default();
+        let s_str = core::str::from_utf8(&st).unwrap_or("");
+        s.check("procfs_self_status_format",
+            s_str.contains("Pid:") && s_str.contains("Name:"),
+            "/proc/self/status без Pid/Name");
+    }
+    {
+        let entries = crate::vfs::list("/proc").ok().unwrap_or_default();
+        let self_entry = entries.iter().find(|e| e.name == "self");
+        s.check("procfs_self_is_dir",
+            self_entry.map(|e| e.is_dir).unwrap_or(false),
+            "self не директория в /proc");
+    }
+    {
+        let w = crate::vfs::write("/proc/version", b"hacked");
+        s.check("procfs_readonly", w.is_err(), "write в /proc прошёл");
+    }
+    {
+        let c = crate::vfs::ramfs_create_file("/proc", "fake", b"x");
+        s.check("procfs_no_create_in", !c, "create_file в /proc прошёл");
+    }
 
-    // ============================================================
-    // 13. NX (No-Execute) включён
-    // ============================================================
+    // ---------- 10. NX ----------
     {
         use x86_64::registers::model_specific::{Efer, EferFlags};
         let flags = Efer::read();
         s.check("nx_enabled",
             flags.contains(EferFlags::NO_EXECUTE_ENABLE),
             "EFER.NXE не выставлен");
+        s.check("efer_flags_intact",
+            flags.contains(EferFlags::LONG_MODE_ENABLE)
+                && flags.contains(EferFlags::NO_EXECUTE_ENABLE),
+            "EFER потерял NXE или LME");
     }
 
-    // ============================================================
-    // 14. Heap-страницы помечены NO_EXECUTE
-    // ============================================================
+    // ---------- 11. Heap-страницы NX ----------
     {
         use x86_64::structures::paging::Translate;
         use x86_64::VirtAddr;
@@ -305,21 +382,17 @@ pub fn run_all() -> u32 {
             let pml4: *const u64 = pml4_virt.as_ptr();
             let i4 = ((addr.as_u64() >> 39) & 0x1FF) as usize;
             let e4 = unsafe { *pml4.add(i4) };
-            let pdpt_phys = e4 & 0x000F_FFFF_FFFF_F000;
-            let pdpt_virt = VirtAddr::new(phys + pdpt_phys);
+            let pdpt_virt = VirtAddr::new(phys + (e4 & 0x000F_FFFF_FFFF_F000));
             let i3 = ((addr.as_u64() >> 30) & 0x1FF) as usize;
             let e3 = unsafe { *(pdpt_virt.as_ptr::<u64>().add(i3)) };
-            let pd_phys = e3 & 0x000F_FFFF_FFFF_F000;
-            let pd_virt = VirtAddr::new(phys + pd_phys);
+            let pd_virt = VirtAddr::new(phys + (e3 & 0x000F_FFFF_FFFF_F000));
             let i2 = ((addr.as_u64() >> 21) & 0x1FF) as usize;
             let e2 = unsafe { *(pd_virt.as_ptr::<u64>().add(i2)) };
-            let pt_phys = e2 & 0x000F_FFFF_FFFF_F000;
-            let pt_virt = VirtAddr::new(phys + pt_phys);
+            let pt_virt = VirtAddr::new(phys + (e2 & 0x000F_FFFF_FFFF_F000));
             let i1 = ((addr.as_u64() >> 12) & 0x1FF) as usize;
             let e1 = unsafe { *(pt_virt.as_ptr::<u64>().add(i1)) };
             let nx = e1 & (1u64 << 63) != 0;
-            s.check("heap_pages_are_nx", nx,
-                "heap-страница не помечена NO_EXECUTE");
+            s.check("heap_pages_are_nx", nx, "heap-страница не NX");
 
             let mapped = unsafe {
                 use x86_64::structures::paging::OffsetPageTable;
@@ -332,47 +405,52 @@ pub fn run_all() -> u32 {
         }
     }
 
-    // ============================================================
-    // 15. USER_ADDR_MAX sanity
-    // ============================================================
+    // ---------- 12. Константы ----------
     {
         const EXPECTED: u64 = 0x0000_8000_0000_0000;
         s.check("user_addr_max_constant",
             crate::memory::USER_ADDR_MAX == EXPECTED,
-            "USER_ADDR_MAX изменился — проверь весь код");
+            "USER_ADDR_MAX изменился");
+        s.check("user_pml4_index_zero",
+            crate::memory::USER_PML4_INDEX == 0,
+            "USER_PML4_INDEX != 0");
     }
 
-    // ============================================================
-    // 16. is_user_range_mapped — в kernel-AS должен быть false
-    // ============================================================
+    // ---------- 13. is_user_range_mapped ----------
     {
-        let r = unsafe { crate::memory::is_user_range_mapped(0x400000, 16) };
-        s.check("user_range_not_mapped_in_kernel_as", !r,
-            "user-адрес 0x400000 считается отображённым в kernel-AS");
+        let in_kernel_as = unsafe { crate::memory::is_user_range_mapped(0x400000, 16) };
+        s.check("user_range_not_mapped_in_kernel_as", !in_kernel_as,
+            "user-адрес считается отображённым в kernel-AS");
+
+        let null_zero = unsafe { crate::memory::is_user_range_mapped(0, 0) };
+        s.check("is_user_range_null_zero_len", null_zero,
+            "нулевой ptr с нулевой длиной должен быть ok");
+
+        let null_nonzero = unsafe { crate::memory::is_user_range_mapped(0, 8) };
+        s.check("is_user_range_null_nonzero_len", !null_nonzero,
+            "нулевой ptr с ненулевой длиной должен быть отвергнут");
+
+        let overflow = unsafe {
+            crate::memory::is_user_range_mapped(0x7FFF_FFFF_FFF0, 0x20)
+        };
+        s.check("is_user_range_no_overflow", !overflow,
+            "overflow не пойман");
     }
 
-    // ============================================================
-    // 17. AddressSpace new/destroy
-    // ============================================================
+    // ---------- 14. AddressSpace ----------
     {
         use x86_64::VirtAddr;
-
         let phys = crate::memory::PHYS_OFFSET.load(Ordering::Acquire);
         let created = if phys == 0 {
             false
         } else {
-            // ИСПРАВЛЕНИЕ: лок FRAME_ALLOCATOR нельзя держать во время
-            // destroy — destroy сам берёт этот же лок, получается deadlock.
-            // Аллоцируем AS в узком блоке, отпускаем лок, потом destroy.
             let pml4_opt = {
                 let mut guard = crate::memory::FRAME_ALLOCATOR.lock();
                 if let Some(alloc) = guard.as_mut() {
                     unsafe {
                         crate::memory::AddressSpace::new_user(VirtAddr::new(phys), alloc)
                     }.map(|a| a.pml4_frame.start_address().as_u64())
-                } else {
-                    None
-                }
+                } else { None }
             };
             match pml4_opt {
                 Some(pml4) => {
@@ -386,9 +464,65 @@ pub fn run_all() -> u32 {
             "не удалось создать/удалить AS");
     }
 
-    // ============================================================
-    // 18. pipe — создание и обмен
-    // ============================================================
+    // ---------- 15. clone_user_pages (eager) в kernel-AS ----------
+    {
+        use x86_64::VirtAddr;
+        let phys = crate::memory::PHYS_OFFSET.load(Ordering::Acquire);
+        let ok = if phys == 0 {
+            false
+        } else {
+            let mut guard = crate::memory::FRAME_ALLOCATOR.lock();
+            let alloc = match guard.as_mut() { Some(a) => a, None => return 1 };
+            let parent = crate::sched::current_pml4();
+            match parent {
+                Some(p) => unsafe {
+                    let child = match crate::memory::AddressSpace::new_user(
+                        VirtAddr::new(phys), alloc)
+                    {
+                        Some(a) => a.pml4_frame.start_address().as_u64(),
+                        None => { return 1; }
+                    };
+                    let r = crate::memory::clone_user_pages(
+                        p, child, VirtAddr::new(phys), alloc);
+                    crate::memory::AddressSpace::destroy(child);
+                    r
+                },
+                None => true,
+            }
+        };
+        s.check("clone_user_pages_kernel_as", ok,
+            "clone_user_pages упал в kernel-AS");
+    }
+
+    // ---------- 16. fork_in_place отвергает kernel-поток ----------
+    {
+        let mut fake_regs = [0u64; 21];
+        fake_regs[16] = 0;
+        fake_regs[19] = 0;
+        let r = unsafe { crate::user::fork_in_place(fake_regs.as_mut_ptr()) };
+        s.check("fork_rejects_non_user", r.is_err(),
+            "fork_in_place принял не-user поток");
+    }
+
+    // ---------- 17. user_mappings_snapshot ----------
+    {
+        let snap = unsafe { crate::memory::user_mappings_snapshot() };
+        serial_println!("[TEST INFO] kernel-AS user_mappings: {} entries", snap.len());
+        s.pass("user_mappings_snapshot_kernel");
+    }
+
+    // ---------- 18. heap accounting ----------
+    {
+        let (used, free, total) = {
+            let a = crate::allocator::ALLOCATOR.lock();
+            (a.used(), a.free(), crate::allocator::HEAP_SIZE)
+        };
+        s.check("heap_used_plus_free",
+            used + free == total,
+            "used + free != HEAP_SIZE");
+    }
+
+    // ---------- 19. pipe ----------
     {
         if let Some(id) = crate::pipe::create() {
             let alive = crate::pipe::is_alive(id);
@@ -404,77 +538,65 @@ pub fn run_all() -> u32 {
             s.fail("pipe_write_read", "pipe::create вернул None");
         }
     }
+    {
+        if let Some(id) = crate::pipe::create() {
+            let data = [0u8; 5000];
+            let first = crate::pipe::write(id, &data);
+            let second = crate::pipe::write(id, &data);
+            s.check("pipe_capacity_full",
+                first == Some(4096) && second.is_none(),
+                "pipe capacity mismatch");
+            crate::pipe::close_reader(id);
+            crate::pipe::close_writer(id);
+        } else {
+            s.fail("pipe_capacity_full", "pipe::create вернул None");
+        }
+    }
+    {
+        if let Some(id) = crate::pipe::create() {
+            crate::pipe::close_writer(id);
+            let mut buf = [0u8; 8];
+            let r = crate::pipe::read(id, &mut buf);
+            s.check("pipe_writer_close_eof", r == Some(0),
+                "read после close_writer не вернул EOF");
+            crate::pipe::close_reader(id);
+        } else {
+            s.fail("pipe_writer_close_eof", "pipe::create вернул None");
+        }
+    }
 
-    // ============================================================
-    // 19. fd table — alloc, dup2, close
-    // ============================================================
+    // ---------- 20. fd ----------
     {
         use crate::fd::{self, FdKind};
         let pid = crate::sched::current_id();
-
         fd::init_for_pid(pid);
         let have_stdin = fd::get(pid, 0).is_some();
-
         let fd_no = fd::alloc_fd(pid, FdKind::Stdin);
         let got = fd::get(pid, fd_no).is_some();
         let dup_ok = fd::dup2(pid, 0, 200);
         let dup_kind = fd::get(pid, 200).is_some();
         let closed = fd::close(pid, fd_no);
         let _ = fd::close(pid, 200);
-
         s.check("fd_alloc_dup_close",
             have_stdin && got && dup_ok && dup_kind && closed,
             "fd operations не прошли");
     }
-
-    // ============================================================
-    // 20. procfs::read синтаксис meminfo
-    // ============================================================
     {
-        let mem = crate::vfs::read("/proc/meminfo").ok().unwrap_or_default();
-        let s_str = core::str::from_utf8(&mem).unwrap_or("");
-        s.check("procfs_meminfo_format",
-            s_str.contains("HeapTotal") && s_str.contains("HeapUsed"),
-            "/proc/meminfo не содержит ожидаемых полей");
+        use crate::fd;
+        let parent = crate::sched::current_id();
+        fd::init_for_pid(parent);
+        let fake_child: u64 = 999_999;
+        fd::fork_from(parent, fake_child);
+        let has_stdin  = fd::get(fake_child, 0).is_some();
+        let has_stdout = fd::get(fake_child, 1).is_some();
+        let has_stderr = fd::get(fake_child, 2).is_some();
+        fd::close_all_for_pid(fake_child);
+        s.check("fd_fork_from_copies_std",
+            has_stdin && has_stdout && has_stderr,
+            "fork_from не скопировал std fd");
     }
 
-    // ============================================================
-    // 21. /proc/self/status содержит Pid:
-    // ============================================================
-    {
-        let st = crate::vfs::read("/proc/self/status").ok().unwrap_or_default();
-        let s_str = core::str::from_utf8(&st).unwrap_or("");
-        s.check("procfs_self_status_format",
-            s_str.contains("Pid:") && s_str.contains("Name:"),
-            "/proc/self/status без Pid/Name");
-    }
-
-    // ============================================================
-    // 22. procfs list имеет self/ как директорию
-    // ============================================================
-    {
-        let entries = crate::vfs::list("/proc").ok().unwrap_or_default();
-        let self_entry = entries.iter().find(|e| e.name == "self");
-        s.check("procfs_self_is_dir",
-            self_entry.map(|e| e.is_dir).unwrap_or(false),
-            "self не директория в /proc");
-    }
-
-    // ============================================================
-    // 23. Efer::read/write не портит флаги
-    // ============================================================
-    {
-        use x86_64::registers::model_specific::{Efer, EferFlags};
-        let before = Efer::read();
-        let has_nxe = before.contains(EferFlags::NO_EXECUTE_ENABLE);
-        let has_lme = before.contains(EferFlags::LONG_MODE_ENABLE);
-        s.check("efer_flags_intact", has_nxe && has_lme,
-            "EFER потерял NXE или LME");
-    }
-
-    // ============================================================
-    // 24. FAT32 fs — корректный stat C:/ (если смонтирован)
-    // ============================================================
+    // ---------- 21. FAT32 root stat ----------
     {
         let entries = crate::vfs::fat32_list_root();
         if entries.is_empty() {
@@ -487,9 +609,7 @@ pub fn run_all() -> u32 {
         }
     }
 
-    // ============================================================
-    // 25. FAT32 LFN — запись и чтение длинного имени
-    // ============================================================
+    // ---------- 22. FAT32 LFN ----------
     {
         let entries = crate::vfs::fat32_list_root();
         if entries.is_empty() {
@@ -511,9 +631,7 @@ pub fn run_all() -> u32 {
         }
     }
 
-    // ============================================================
-    // 26. Список потоков
-    // ============================================================
+    // ---------- 23. Список потоков ----------
     {
         let threads = crate::sched::list_threads_snapshot();
         let has_main = threads.iter().any(|t| {
@@ -526,47 +644,49 @@ pub fn run_all() -> u32 {
             "снапшот пуст");
     }
 
-    // ============================================================
-    // 27. Системные тики не сбрасываются
-    // ============================================================
+    // ---------- 24. Ticks monotonic ----------
     {
         let t0 = crate::interrupts::ticks();
         crate::sched::sleep_ms(200);
         let t1 = crate::interrupts::ticks();
         s.check("ticks_monotonic", t1 >= t0 && t1 - t0 >= 3,
-            "ticks не растут за 200мс (ожидали хотя бы 3 тика)");
+            "ticks не растут за 200мс");
     }
 
-    // ============================================================
-    // 28. procfs не пишется
-    // ============================================================
-    {
-        let w = crate::vfs::write("/proc/version", b"hacked");
-        s.check("procfs_readonly", w.is_err(),
-            "write в /proc прошёл");
-    }
-
-    // ============================================================
-    // 29. procfs не создаёт файлов
-    // ============================================================
-    {
-        let c = crate::vfs::ramfs_create_file("/proc", "fake", b"x");
-        s.check("procfs_no_create_in", !c,
-            "create_file в /proc прошёл");
-    }
-
-    // ============================================================
-    // 30. Ticks после стольких тестов всё ещё идут
-    // ============================================================
+    // ---------- 25. Timer alive ----------
     {
         let a = crate::interrupts::ticks();
         crate::sched::sleep_ms(50);
         let b = crate::interrupts::ticks();
-        s.check("timer_alive_at_end", b > a,
-            "таймер умер во время тестов");
+        s.check("timer_alive_at_end", b > a, "таймер умер во время тестов");
     }
 
-    // ============================================================
+    // ---------- 26. current_pml4 в kernel main ----------
+    {
+        let p = crate::sched::current_pml4();
+        s.check("current_pml4_is_none_in_main",
+            p.is_none(),
+            "current_pml4 не None в kernel main");
+    }
+
+    // ---------- 27. COW infrastructure ----------
+    {
+        // cow_release на неразделяемом фрейме → true.
+        let released = crate::memory::cow_release(0xDEAD_BEEF_000);
+        s.check("cow_release_unshared", released, "unshared release != true");
+
+        // cow_mark_shared дважды → refcount 3, освобождается только на 3-й.
+        crate::memory::cow_mark_shared(0xCAFE_0000);
+        crate::memory::cow_mark_shared(0xCAFE_0000);
+        let r1 = crate::memory::cow_release(0xCAFE_0000);
+        let r2 = crate::memory::cow_release(0xCAFE_0000);
+        let r3 = crate::memory::cow_release(0xCAFE_0000);
+        s.check("cow_refcount_lifecycle",
+            !r1 && !r2 && r3,
+            "refcount списывается неправильно");
+    }
+
+    // ----------
     serial_println!(
         "[TEST] === smoke tests end: passed={} failed={} ===",
         s.passed, s.failed

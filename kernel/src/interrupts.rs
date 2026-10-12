@@ -119,26 +119,19 @@ extern "x86-interrupt" fn double_fault_handler(
     }
 }
 
-/// Page fault обрабатывается по двум принципиально разным сценариям.
+/// Page fault обрабатывается по трём сценариям:
 ///
-/// - **User fault** (`USER_MODE` установлен): поток Ring 3 задел что-то
-///   недозволенное (stack overflow в guard-страницу, обращение к unmapped
-///   адресу, запись в RX-сегмент и т.п.). Логируем и корректно убиваем
-///   только этот поток через `sched::exit_current()`.
-///
-/// - **Kernel fault** (`USER_MODE` снят): баг ядра. Логируем, печатаем
-///   полный дамп и останавливаемся — продолжать нельзя, состояние ядра
-///   неопределено.
-///
-/// Перед чтением `[user_rsp]` обязательно проверяем, что диапазон реально
-/// отображён в текущем AS. Иначе получим вложенный fault → double fault.
+/// 1. **COW write-fault** (user, write, protection, не instr, PTE помечен
+///    COW-битом): копируем фрейм, обновляем PTE, возвращаемся — CPU
+///    повторит инструкцию.
+/// 2. **User fault** (Ring 3, любой другой): убиваем поток.
+/// 3. **Kernel fault** (Ring 0): дамп + halt.
 extern "x86-interrupt" fn page_fault_handler(
     sf: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    // ИСПРАВЛЕНИЕ: в x86_64 0.15 `Cr2::read()` возвращает
-    // `Result<VirtAddr, VirtAddrNotValid>`. Для логирования каноничность
-    // неважна, поэтому берём сырое u64 через `read_raw()`.
+    // ИСПРАВЛЕНИЕ: `Cr2::read()` в x86_64 0.15 возвращает Result.
+    // Для логирования каноничность неважна — берём сырое u64.
     let addr_raw: u64 = Cr2::read_raw();
     let addr: VirtAddr = VirtAddr::new_truncate(addr_raw);
 
@@ -146,6 +139,14 @@ extern "x86-interrupt" fn page_fault_handler(
     let write = error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
     let user = error_code.contains(PageFaultErrorCode::USER_MODE);
     let instr = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
+
+    // Сначала пробуем COW: write-fault на read-only странице, помеченной
+    // программным COW-битом. Только для Ring 3.
+    if user && write && protection && !instr {
+        if unsafe { crate::memory::handle_cow_write(addr_raw) } {
+            return;
+        }
+    }
 
     crate::log_error!("EXCEPTION: PAGE FAULT");
     crate::log_error!("  addr:       {:#x} (raw {:#x})", addr.as_u64(), addr_raw);
@@ -164,8 +165,6 @@ extern "x86-interrupt" fn page_fault_handler(
 
 /// User-mode page fault: печатаем контекст, убиваем текущий поток.
 fn handle_user_fault(sf: &InterruptStackFrame, addr: VirtAddr) -> ! {
-    // В Ring 3 `sf.stack_pointer` содержит сохранённый user RSP из iretq-фрейма
-    // (не kernel RSP обработчика).
     let user_rsp = sf.stack_pointer.as_u64();
     crate::log_error!("  user_rsp:   {:#x}", user_rsp);
 
@@ -191,7 +190,7 @@ fn handle_user_fault(sf: &InterruptStackFrame, addr: VirtAddr) -> ! {
     }
 
     crate::log_warn!("[fault] killing user thread at addr {:#x}", addr.as_u64());
-    crate::sched::exit_current();
+    crate::sched::exit_current_with_code(-11);
 }
 
 /// Kernel-mode page fault: баг ядра, продолжать нельзя.

@@ -1,18 +1,4 @@
 //! Виртуальная файловая система /proc.
-//!
-//! Не хранит данных — каждый раз генерирует содержимое на лету.
-//! Поддерживаемые пути:
-//! - `/proc`                — каталог
-//! - `/proc/version`        — версия ядра
-//! - `/proc/uptime`         — секунды с момента запуска
-//! - `/proc/meminfo`        — состояние heap-аллокатора
-//! - `/proc/ps`             — список потоков
-//! - `/proc/self`           — каталог (псевдоним текущего процесса)
-//! - `/proc/self/status`    — статус текущего потока
-//! - `/proc/self/maps`      — карта адресного пространства
-//!
-//! Доступ идёт через VFS (`vfs::read`, `vfs::list`, `vfs::ramfs_stat`):
-//! те функции сначала проверяют `is_proc_path()` и делегируют сюда.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -25,13 +11,13 @@ pub fn is_proc_path(path: &str) -> bool {
     path == ROOT || path.starts_with("/proc/")
 }
 
-/// Прочитать виртуальный файл. `None` — путь не существует.
 pub fn read(path: &str) -> Option<Vec<u8>> {
     let s: String = match path {
         "/proc/version"        => version_content(),
         "/proc/uptime"         => uptime_content(),
         "/proc/meminfo"        => meminfo_content(),
         "/proc/ps"             => ps_content(),
+        "/proc/kmsg"           => crate::log::snapshot(),
         "/proc/self/status"    => self_status_content(),
         "/proc/self/maps"      => self_maps_content(),
         _ => return None,
@@ -39,7 +25,6 @@ pub fn read(path: &str) -> Option<Vec<u8>> {
     Some(s.into_bytes())
 }
 
-/// Существует ли путь.
 pub fn exists(path: &str) -> bool {
     matches!(
         path,
@@ -49,6 +34,7 @@ pub fn exists(path: &str) -> bool {
             | "/proc/uptime"
             | "/proc/meminfo"
             | "/proc/ps"
+            | "/proc/kmsg"
             | "/proc/self"
             | "/proc/self/"
             | "/proc/self/status"
@@ -56,7 +42,6 @@ pub fn exists(path: &str) -> bool {
     )
 }
 
-/// `(size, is_dir)`.
 pub fn stat(path: &str) -> Option<(u64, bool)> {
     match path {
         "/proc" | "/proc/" | "/proc/self" | "/proc/self/" => Some((0, true)),
@@ -64,7 +49,6 @@ pub fn stat(path: &str) -> Option<(u64, bool)> {
     }
 }
 
-/// Листинг каталога. Возвращает `(name, is_dir, size)`.
 pub fn list(path: &str) -> Vec<(String, bool, u32)> {
     match path {
         "/proc" | "/proc/" => {
@@ -73,6 +57,7 @@ pub fn list(path: &str) -> Vec<(String, bool, u32)> {
                 ("uptime".to_string(), false, uptime_content().len() as u32),
                 ("meminfo".to_string(), false, meminfo_content().len() as u32),
                 ("ps".to_string(), false, ps_content().len() as u32),
+                ("kmsg".to_string(), false, crate::log::snapshot().len() as u32),
                 ("self".to_string(), true, 0),
             ]
         }
@@ -143,8 +128,6 @@ fn self_status_content() -> String {
     )
 }
 
-/// Карта памяти текущего AS в формате, похожем на `/proc/<pid>/maps` Linux:
-/// `start-end perms`
 fn self_maps_content() -> String {
     let maps = unsafe { crate::memory::user_mappings_snapshot() };
     let mut s = String::new();
