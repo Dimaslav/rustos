@@ -46,17 +46,20 @@ fn which_qemu() -> &'static str {
 /// Интерактивный запуск: WHPX + kernel-irqchip=off.
 ///
 /// `kernel-irqchip=off` — обходной путь для известного бага, при котором
-/// VGA не инициализируется с WHPX (гость показывает
-/// "Guest has not initialized the display"). Всё ускорение остаётся.
+/// VGA не инициализируется с WHPX.
+///
+/// Звук: QEMU эмулирует AC'97. Хостовый бэкенд `none` = без вывода в
+/// динамики. Для слышимого звука на Windows замени `none` на `dsound`,
+/// на Linux — на `pa` (PulseAudio).
+///
+/// Сеть: e1000 (Intel 82540EM) + user-mode сеть (SLIRP). Хост виден
+/// как 10.0.2.2, DNS — 10.0.2.3, шлюз — 10.0.2.2.
 fn run_interactive(bios_path: &str, disk_path: &str) {
     let qemu = which_qemu();
     let status = Command::new(qemu)
         .args([
             "-m", "512M",
 
-            // WHPX + kernel-irqchip=off. Это обходной путь для известного
-            // бага, при котором VGA-адаптер не инициализируется, пока
-            // эмуляция контроллера прерываний находится в ядре (KVM/WHPX).
             "-accel", "whpx,kernel-irqchip=off",
             "-cpu", "max",
 
@@ -72,8 +75,14 @@ fn run_interactive(bios_path: &str, disk_path: &str) {
             "-global", "VGA.xres=1280",
             "-global", "VGA.yres=720",
 
-            // Без zoom-to-fit=on — он включает CPU-скейлинг поверх
-            // framebuffer'а и заметно тормозит даже с WHPX.
+            // Звук: AC'97.
+            "-audiodev", "none,id=snd0",
+            "-device", "AC97,audiodev=snd0",
+
+            // Сеть: e1000 + user-mode сеть.
+            "-netdev", "user,id=net0",
+            "-device", "e1000,netdev=net0",
+
             "-display", "gtk",
         ])
         .status()
@@ -84,9 +93,7 @@ fn run_interactive(bios_path: &str, disk_path: &str) {
     }
 }
 
-/// Fallback без аппаратного ускорения — на случай если WHPX недоступен.
-/// Многопоточный TCG в разы быстрее однопоточного, но всё равно
-/// заметно медленнее WHPX.
+/// Fallback без аппаратного ускорения.
 #[allow(dead_code)]
 fn run_interactive_tcg(bios_path: &str, disk_path: &str) {
     let qemu = which_qemu();
@@ -105,6 +112,10 @@ fn run_interactive_tcg(bios_path: &str, disk_path: &str) {
             "-global", "VGA.edid=on",
             "-global", "VGA.xres=1280",
             "-global", "VGA.yres=720",
+            "-audiodev", "none,id=snd0",
+            "-device", "AC97,audiodev=snd0",
+            "-netdev", "user,id=net0",
+            "-device", "e1000,netdev=net0",
             "-display", "gtk",
         ])
         .status()
@@ -115,10 +126,7 @@ fn run_interactive_tcg(bios_path: &str, disk_path: &str) {
     }
 }
 
-/// Headless-запуск для smoke-тестов.
-///
-/// Использует TCG, а не WHPX: в headless-режиме (без дисплея) WHPX
-/// падает с "Unexpected VP exit code 4". Тестам скорость не важна.
+/// Headless-запуск для smoke-тестов (использует TCG).
 fn run_headless(bios_path: &str, disk_path: &str) {
     let qemu = which_qemu();
     let log = "serial.log";
@@ -135,6 +143,9 @@ fn run_headless(bios_path: &str, disk_path: &str) {
         "-no-reboot",
         "-vga", "std",
         "-global", "VGA.vgamem_mb=32",
+        // Сеть есть и в headless — чтобы `[e1000] MAC=...` был в логе.
+        "-netdev", "user,id=net0",
+        "-device", "e1000,netdev=net0",
     ]);
     if Path::new(disk_path).exists() {
         cmd.args([
@@ -143,7 +154,7 @@ fn run_headless(bios_path: &str, disk_path: &str) {
         ]);
     }
 
-    eprintln!("[test] запускаю QEMU headless (timeout=30s)");
+    eprintln!("[test] запускаю QEMU headless (timeout=60s)");
     let mut child = cmd.spawn().expect("QEMU не запустился");
 
     let timeout = Duration::from_secs(60);

@@ -12,6 +12,10 @@ name = "user"
 path = "src/main.rs"
 
 [[bin]]
+name = "init"
+path = "src/bin/init.rs"
+
+[[bin]]
 name = "worker"
 path = "src/bin/worker.rs"
 
@@ -38,6 +42,50 @@ path = "src/bin/cat.rs"
 [[bin]]
 name = "ps"
 path = "src/bin/ps.rs"
+
+[[bin]]
+name = "cp"
+path = "src/bin/cp.rs"
+
+[[bin]]
+name = "wc"
+path = "src/bin/wc.rs"
+
+[[bin]]
+name = "head"
+path = "src/bin/head.rs"
+
+[[bin]]
+name = "dmesg"
+path = "src/bin/dmesg.rs"
+
+[[bin]]
+name = "kill"
+path = "src/bin/kill.rs"
+
+[[bin]]
+name = "uname"
+path = "src/bin/uname.rs"
+
+[[bin]]
+name = "which"
+path = "src/bin/which.rs"
+
+[[bin]]
+name = "env"
+path = "src/bin/env.rs"
+
+[[bin]]
+name = "viewer"
+path = "src/bin/viewer.rs"
+
+[[bin]]
+name = "play"
+path = "src/bin/play.rs"
+
+[[bin]]
+name = "ping"
+path = "src/bin/ping.rs"
 
 [profile.release]
 panic = "abort"

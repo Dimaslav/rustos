@@ -105,9 +105,6 @@ pub fn exec_argv(name: &str, args: &[&str]) -> u64 {
     }
 }
 
-/// Syscall 43: заменить образ **текущего** процесса. При успехе
-/// управление уходит в `_start` новой программы — функция **не
-/// возвращается**.
 pub const SYS_EXEC_REPLACE: u64 = 43;
 
 #[inline(always)]
@@ -120,6 +117,86 @@ pub fn exec_replace(name: &str) -> u64 {
             0,
         )
     }
+}
+
+pub const SYS_FORK: u64 = 44;
+
+#[inline(always)]
+pub fn fork() -> u64 {
+    unsafe { syscall(SYS_FORK, 0, 0, 0) }
+}
+
+pub const SYS_IMAGE_DECODE: u64 = 45;
+
+pub fn image_info(data: &[u8]) -> Option<(usize, usize)> {
+    let r = unsafe {
+        syscall4(
+            SYS_IMAGE_DECODE,
+            data.as_ptr() as u64,
+            data.len() as u64,
+            0,
+            0,
+        )
+    };
+    if r == u64::MAX { return None; }
+    Some(((r >> 32) as usize, (r & 0xFFFF_FFFF) as usize))
+}
+
+pub fn image_decode(data: &[u8], out: u64, out_cap: usize) -> Option<(usize, usize)> {
+    let r = unsafe {
+        syscall4(
+            SYS_IMAGE_DECODE,
+            data.as_ptr() as u64,
+            data.len() as u64,
+            out,
+            out_cap as u64,
+        )
+    };
+    if r == u64::MAX { return None; }
+    Some(((r >> 32) as usize, (r & 0xFFFF_FFFF) as usize))
+}
+
+pub const SYS_SOUND_BEEP: u64 = 46;
+
+pub fn beep(freq_hz: u32, duration_ms: u32) {
+    unsafe {
+        syscall(SYS_SOUND_BEEP, freq_hz as u64, duration_ms as u64, 0);
+    }
+}
+
+pub const SYS_SOUND_PLAY_PCM: u64 = 47;
+
+pub fn sound_play_pcm(samples: &[i16]) {
+    unsafe {
+        syscall(
+            SYS_SOUND_PLAY_PCM,
+            samples.as_ptr() as u64,
+            samples.len() as u64,
+            0,
+        );
+    }
+}
+
+pub const SYS_NET_PING: u64 = 48;
+pub const SYS_NET_INFO: u64 = 49;
+
+/// Ping IPv4-адрес. `ip` — 4 байта. Возвращает RTT в мс или `None`.
+pub fn net_ping(ip: [u8; 4], timeout_ms: u64) -> Option<u64> {
+    let packed = ((ip[0] as u64) << 24)
+        | ((ip[1] as u64) << 16)
+        | ((ip[2] as u64) << 8)
+        | (ip[3] as u64);
+    let r = unsafe { syscall(SYS_NET_PING, packed, timeout_ms, 0) };
+    if r == u64::MAX { None } else { Some(r) }
+}
+
+/// Информация о сети: (our_ip, gateway_ip, dns_ip, mac_lo32).
+pub fn net_info() -> Option<([u8; 4], [u8; 4], [u8; 4], u32)> {
+    let mut buf = [0u32; 4];
+    let r = unsafe { syscall(SYS_NET_INFO, buf.as_mut_ptr() as u64, 0, 0) };
+    if r != 0 { return None; }
+    let to_ip = |v: u32| v.to_be_bytes();
+    Some((to_ip(buf[0]), to_ip(buf[1]), to_ip(buf[2]), buf[3]))
 }
 
 // ---------- Файлы ----------
@@ -479,8 +556,6 @@ pub unsafe fn collect_args(argc: u64, argv: *const *const u8) -> alloc::vec::Vec
     }
     v
 }
-
-// ---------- mem* / strlen ----------
 
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {

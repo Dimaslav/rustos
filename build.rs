@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const USER_BINS: [&str; 8] = ["user", "worker", "calculator", "shell", "echo", "ls", "cat", "ps"];
+const USER_BINS: [&str; 20] = [
+    "user", "init", "worker", "calculator", "shell", "echo",
+    "ls", "cat", "ps", "cp", "wc", "head", "dmesg", "kill",
+    "uname", "which", "env", "viewer", "play", "ping",
+];
 
 fn main() {
     build_user_programs();
@@ -57,8 +61,6 @@ fn build_user_programs() {
     let user_dir = PathBuf::from("user");
     let target = "x86_64-unknown-none";
 
-    // ВАЖНО: без compiler-builtins-mem — mem* определены в user/src/lib.rs.
-    // Иначе символы конфликтуют.
     let status = Command::new("cargo")
         .current_dir(&user_dir)
         .args([
